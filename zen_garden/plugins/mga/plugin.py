@@ -445,7 +445,7 @@ class MGA:
         return self.n_z + (1 if self.include_cost else 0)
 
     # Aggregation dims per axis kind (module-private constants inlined here).
-    _TECH_AGG = ["set_capacity_types", "set_location", "set_time_steps_yearly"]
+    _TECH_AGG = ["set_capacity_types", "set_location", "set_years"]
     _CARRIER_AGG = ["set_carriers", "set_nodes", "set_time_steps_operation"]
 
     def _build_capacity_keep_mask(self):
