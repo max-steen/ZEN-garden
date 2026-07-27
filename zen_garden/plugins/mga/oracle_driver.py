@@ -15,6 +15,14 @@ nonconvex mode) with identical witness and metric semantics but a bound that
 closes. After a non-converged loop, one long step-2 solve on the final
 geometry (oracle.final_certificate_time_limit) can tighten the stored metric.
 The solver is hardcoded to Gurobi.
+
+pyoNearOpt compatibility: with the base (published) pyoNearOpt only the
+default "kkt_milp" formulation exists ("dual_bilinear" needs the patched
+package and fails otherwise), and the base package must be run with
+oracle.use_bigM: true -- under the SOS1 encoding it reports the step-2
+INCUMBENT as the metric, which is not a valid upper bound on the max-min
+distance, so the convergence claim, the in-loop t_max cap, and the final
+certificate's cap would all rest on an unsound value.
 """
 
 import logging
@@ -25,16 +33,6 @@ from pathlib import Path
 import pandas as pd
 
 from .polytope_io import Polytope, save_polytope
-
-# Default Gurobi options for ORACLE's internal step-2 solves; override via
-# the oracle.milp_options config key.
-DEFAULT_MILP_OPTIONS = {
-    "OutputFlag": 1,
-    "MIPGap": 0.05,
-    "MIPGapAbs": 0.001,
-    "TimeLimit": 1800,
-    "Threads": 10,
-}
 
 
 def run_oracle_mode(mga, oracle_cfg):
@@ -56,29 +54,45 @@ def run_oracle_mode(mga, oracle_cfg):
         logging.warning(
             "MGA oracle: use_bigM is ignored with formulation='dual_bilinear'."
         )
+    vmm_init = bool(oracle_cfg.get("vmm_initialization", False))
 
     # The fmax LPs must run before the projection model is added: they provide
-    # the normalisation denominators and the initial outer box.
+    # the normalisation denominators and the initial outer box. The optional
+    # fmin LPs complete VMM, so that all 2*n_z extreme designs seed the
+    # initial inner approximation.
     mga.compute_fmax_normalization()
-    mga.setup_projection_model()
+    if vmm_init:
+        mga.solve_extreme_lps("min")
+    initial_points = mga.initial_inner_points(include_extreme_designs=vmm_init)
+    mga.setup_projection_model(initial_points=initial_points)
 
     with _coordinate_warnings_suppressed():
         A0, b0 = mga.build_initial_outer_approximation()
         name_list = list(mga.z_names)
         if mga.include_cost:
             name_list.append("net_present_cost")
-        poly = approximation(
-            A=A0, X=mga.z_star_explore.reshape(1, -1), b=b0,
+        approximation_kwargs = dict(
+            A=A0, X=initial_points, b=b0,
             name_list=name_list,
             use_bigM=use_bigM,
-            formulation=formulation,
         )
-        # pyoNearOpt's Big-M and t_max defaults are tuned for small toy models.
+        # Only the patched pyoNearOpt knows the keyword; the base package's
+        # sole formulation is kkt_milp, so omitting it is equivalent.
+        if formulation != "kkt_milp":
+            approximation_kwargs["formulation"] = formulation
+        poly = approximation(**approximation_kwargs)
+        # Md is pyoNearOpt's big-M on the KKT duals (default 1e3, used only
+        # with use_bigM). It must upper-bound the true duals or optima are
+        # silently cut off; pyoNearOpt raises when a dual hits it, so the
+        # default here is simply generous. t_max caps the max-min distance
+        # (pyoNearOpt default 1e6).
         poly.Md = float(oracle_cfg.get("Md_override", 1e8))
         if oracle_cfg.get("t_max_override") is not None:
             poly.t_max = float(oracle_cfg["t_max_override"])
 
-    milp_options = dict(oracle_cfg.get("milp_options", DEFAULT_MILP_OPTIONS))
+    # Gurobi options for the step-2 solves: solver defaults unless set in
+    # the config (production runs should set at least a TimeLimit).
+    milp_options = dict(oracle_cfg.get("milp_options", {}))
     if formulation == "dual_bilinear":
         # The bilinear objective needs Gurobi's global nonconvex-QP mode.
         milp_options.setdefault("NonConvex", 2)
@@ -117,8 +131,9 @@ def _run_final_certificate(df, poly, tolerance, oracle_cfg, milp_options):
     The per-iteration step-2 solves get a short TimeLimit because the loop
     only needs the next trial point; the proof (the reported metric) is
     cheaper bought once, at the end. The loop's last reported metric is a
-    valid cap for this solve; the certified value is appended as an extra
-    diagnostics row so the saved npz carries the best-known metric.
+    valid cap for this solve (with the base pyoNearOpt this requires
+    use_bigM, see the module docstring); the certified value is appended as
+    an extra diagnostics row so the saved npz carries the best-known metric.
     Controlled by oracle.final_certificate_time_limit (seconds, 0 = off).
     """
     time_limit = float(oracle_cfg.get("final_certificate_time_limit", 0) or 0)

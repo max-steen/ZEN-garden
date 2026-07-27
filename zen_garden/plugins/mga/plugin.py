@@ -6,11 +6,15 @@ Registers an `after_solve` handler that adds a near-optimality cost budget
 under one of two modes:
 
 * "weights": one solve per user-provided weight dict, each minimising
-  sum_i w_i * capacity_addition_i.
+  sum_i w_i * capacity_addition_i on each technology's selected capacity
+  type (energy for storage technologies, power otherwise).
 * "oracle": the ORACLE algorithm (Turan, Moret, Bardow 2026) iteratively
   refines inner and outer polytope approximations of the near-optimal space
   via L-infinity projections. The refinement loop lives in pyoNearOpt; the
-  projection solves run on the ZEN-garden model (driver in oracle.py).
+  projection solves run on the ZEN-garden model (driver in oracle_driver.py).
+
+Rolling-horizon runs are rejected: after_solve fires after the horizon loop,
+so the plugin would only see the final step's model.
 
 Oracle-mode exploration axes are groups of technologies (summed capacity
 addition) or carriers (duration-weighted annual import), see axes.py. All
@@ -31,9 +35,17 @@ Config (the "plugins.mga" block in config.json):
     include_carrier_imports (list): carrier-import axes, same entry format.
     oracle (dict): tolerance (required), max_iterations (default 200),
         formulation ("kkt_milp" | "dual_bilinear"), include_cost (bool),
+        vmm_initialization (bool, default False: complete the fmax LPs into
+        a full VMM pass -- additionally solve one fmin LP per axis and seed
+        the initial inner approximation with all 2*n_z extreme designs; the
+        initial outer box stays [0, 1]),
         milp_options (Gurobi options for ORACLE's internal step-2 solves),
         Md_override, t_max_override, use_bigM,
-        final_certificate_time_limit (seconds, 0 = off). See oracle.py.
+        final_certificate_time_limit (seconds, 0 = off). See oracle_driver.py.
+
+pyoNearOpt compatibility: "dual_bilinear" and a trustworthy metric under the
+SOS1 encoding need the patched pyoNearOpt; with the unpatched (base) package
+use formulation "kkt_milp" AND set use_bigM: true (see oracle_driver.py).
 """
 
 import logging
@@ -46,7 +58,7 @@ from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.postprocess.postprocess import Postprocess
 
 from .axes import Axis, axis_physical_unit, build_axis_groups, cost_physical_unit
-from .oracle import run_oracle_mode
+from .oracle_driver import run_oracle_mode
 from .polytope_io import CARRIER_IMPORT, TECH_CAPACITY
 
 # Module-level config, updated by the plugin loader with the user's
@@ -133,6 +145,9 @@ class MGA:
         self.u_star = None
         self._u_tilde = None
         self._offset = None
+        # Raw exploration vectors of the extreme (fmax/fmin) designs,
+        # collected by solve_extreme_lps for the VMM initialisation.
+        self._extreme_designs_raw = []
         # Known near-optimal points in explore coordinates; backs the
         # cut-validity guard in find_nearest_point (seeded with z*).
         self._inner_points = None
@@ -203,10 +218,16 @@ class MGA:
     # ------------------------------------------------------------------
 
     def run_iteration(self, weights: dict, iter_id: int):
-        """Solve one weights-mode iteration: min sum_i w_i * capacity_addition_i."""
+        """Solve one weights-mode iteration: min sum_i w_i * capacity_addition_i.
+
+        The capacity-type mask applies here as in oracle mode, so storage
+        technologies are weighted on their energy capacity only (summing
+        power and energy would mix units).
+        """
         weight_array = self._build_weight_array(weights)
         self.model.add_objective(
-            (weight_array * self.cap_add).sum(), sense="min", overwrite=True
+            (weight_array * self._capacity_mask * self.cap_add).sum(),
+            sense="min", overwrite=True,
         )
         logging.info(f"MGA iter {iter_id}: weights = {weights}")
         self._solve_and_postprocess(f"mga_iter_{iter_id}")
@@ -396,36 +417,16 @@ class MGA:
         The maxima U_i* are both the normalisation denominators (z_i / U_i*)
         and the initial outer box. They are always solved fresh -- the LPs
         are cheap next to the full run, and caching would risk stale values.
-        Each LP's full solution is saved via Postprocess as
-        <model_name>_fmax_<axis>. Sets u_star and the augmented
-        scale/offset; call after setup().
+        Sets u_star and the augmented scale/offset; call after setup().
         """
-        u_star = []
-        for axis in self.axes:
-            self.model.add_objective(
-                self._axis_linexpr(axis), sense="max", overwrite=True
+        self.u_star = self.solve_extreme_lps("max")
+        bad = [name for name, u in zip(self.z_names, self.u_star, strict=True)
+               if not np.isfinite(u) or u <= 0]
+        if bad:
+            raise RuntimeError(
+                f"MGA fmax: U* <= 0 for axes {bad}; cannot serve as "
+                f"normalisation denominators -- remove them from the config."
             )
-            start = time.time()
-            self.optimization_setup.solve()
-            if not self.optimization_setup.optimality:
-                raise RuntimeError(
-                    f"MGA fmax LP for axis {axis.name!r} ended with "
-                    f"{self.model.termination_condition!r} ('unbounded' means "
-                    f"the axis has no finite near-optimal maximum)."
-                )
-            self._postprocess(f"fmax_{axis.name}")
-            u_i = self._axis_value(axis)
-            if not np.isfinite(u_i) or u_i <= 0:
-                raise RuntimeError(
-                    f"MGA fmax: U*[{axis.name}] = {u_i:.6g} cannot serve as a "
-                    f"normalisation denominator; remove this axis from the config."
-                )
-            u_star.append(u_i)
-            logging.info(
-                f"MGA fmax: U*[{axis.name}] = {u_i:.6g} "
-                f"(LP took {time.time() - start:.1f} s)"
-            )
-        self.u_star = np.array(u_star, dtype=float)
 
         # Augmented scale/offset: design axes (U_i*, 0); the cost axis, when
         # present, (epsilon * C*, C*).
@@ -437,12 +438,65 @@ class MGA:
         self._u_tilde = np.array(scale, dtype=float)
         self._offset = np.array(offset, dtype=float)
 
+    def solve_extreme_lps(self, sense: str) -> np.ndarray:
+        """Drive every axis to its near-optimal extreme: one LP per axis with
+        the axis value as objective (sense "max" or "min" -- together the two
+        halves of VMM, variable min/max).
+
+        Each LP must reach a proven optimum ("unbounded" on a max means the
+        axis has no finite near-optimal maximum). Every solution is saved via
+        Postprocess as <model_name>_f<sense>_<axis> and recorded as an
+        extreme design for the VMM initialisation. Returns the per-axis
+        extreme values.
+        """
+        values = []
+        for axis in self.axes:
+            self.model.add_objective(
+                self._axis_linexpr(axis), sense=sense, overwrite=True
+            )
+            start = time.time()
+            self.optimization_setup.solve()
+            if not self.optimization_setup.optimality:
+                raise RuntimeError(
+                    f"MGA f{sense} LP for axis {axis.name!r} ended with "
+                    f"{self.model.termination_condition!r}."
+                )
+            self._postprocess(f"f{sense}_{axis.name}")
+            value = self._axis_value(axis)
+            values.append(value)
+            self._collect_extreme_design()
+            logging.info(
+                f"MGA f{sense}: {axis.name} = {value:.6g} "
+                f"(LP took {time.time() - start:.1f} s)"
+            )
+        return np.array(values, dtype=float)
+
+    def _collect_extreme_design(self) -> None:
+        """Record the loaded solution's raw exploration vector."""
+        z_raw = np.array([self._axis_value(a) for a in self.axes], dtype=float)
+        c_raw = float(self.model.variables["net_present_cost"].solution.sum())
+        self._extreme_designs_raw.append((z_raw, c_raw))
+
+    def initial_inner_points(self, include_extreme_designs: bool) -> np.ndarray:
+        """Certified near-optimal points seeding the inner approximation.
+
+        Always contains z* (row 0); with include_extreme_designs also every
+        design collected by solve_extreme_lps (the VMM initialisation).
+        Rows are in normalised explore coordinates.
+        """
+        points = [self.z_star_explore]
+        if include_extreme_designs:
+            points += [self._to_explore_coords(z, c)
+                       for z, c in self._extreme_designs_raw]
+        return np.vstack(points)
+
     def build_initial_outer_approximation(self) -> tuple[np.ndarray, np.ndarray]:
         """(A0, b0) of the initial outer polytope in normalised coordinates.
 
         Raw rows per design axis: -z_i <= 0 (axis values are sums of
-        non-negative variables) and z_i <= U_i* (tight by construction);
-        plus C* <= C <= (1 + epsilon) * C* when include_cost. Each raw row
+        non-negative variables) and z_i <= U_i* (tight by construction), i.e.
+        the normalised design box is always [0, 1]; plus
+        C* <= C <= (1 + epsilon) * C* when include_cost. Each raw row
         a^T z_raw <= b is then mapped to normalised coordinates via
         z_raw = offset + diag(u_tilde) z_norm, i.e. it becomes
         (a o u_tilde)^T z_norm <= b - a^T offset.
@@ -498,7 +552,7 @@ class MGA:
             )
         self._postprocess(label)
 
-    def setup_projection_model(self) -> None:
+    def setup_projection_model(self, initial_points=None) -> None:
         """Add the L-infinity projection model to the linopy model; call once.
 
         Variables: delta (one entry per design axis on Z_DIM), a scalar t,
@@ -508,6 +562,10 @@ class MGA:
         t-bounds |delta_i| / U_i* <= t (plus |delta_cost| / (epsilon C*)
         <= t), so that min t is the normalised L-infinity distance to the
         trial point.
+
+        `initial_points` (rows in explore coordinates) seeds the cut-validity
+        guard; it defaults to z* alone and should match the X handed to
+        ORACLE.
         """
         z_coord = xr.DataArray(
             np.array(self.z_names), dims=Z_DIM, coords={Z_DIM: self.z_names}
@@ -555,11 +613,14 @@ class MGA:
                 name="mga_oracle_t_neg_cost",
             )
 
-        # Seed the cut-validity guard with z*.
-        self._inner_points = [np.asarray(self.z_star_explore, dtype=float)]
+        # Seed the cut-validity guard with the initial inner points.
+        if initial_points is None:
+            initial_points = [self.z_star_explore]
+        self._inner_points = [np.asarray(p, dtype=float) for p in initial_points]
         logging.info(
             f"MGA oracle: projection model added (n_z = {self.n_z}, "
-            f"include_cost = {self.include_cost})"
+            f"include_cost = {self.include_cost}, "
+            f"{len(self._inner_points)} initial inner point(s))"
         )
 
     def find_nearest_point(self, trial_point: np.ndarray):
@@ -692,6 +753,12 @@ def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
     mode = config["mode"]
     if mode not in ("weights", "oracle"):
         raise ValueError(f"Unknown MGA mode: {mode!r}. Expected 'weights' or 'oracle'.")
+    if optimization_setup.system.use_rolling_horizon:
+        raise ValueError(
+            "MGA does not support rolling-horizon runs: after_solve fires "
+            "after the horizon loop, so MGA would explore only the final "
+            "step's model."
+        )
     if mode == "weights" and not config["iterations"]:
         logging.warning("MGA plugin: weights mode without iterations; skipping.")
         return None
