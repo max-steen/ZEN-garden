@@ -1,18 +1,19 @@
 """Exploration-axis definitions for the MGA plugin.
 
-An axis is one coordinate of the explored near-optimal space: either the
-summed capacity addition of a group of technologies or the duration-weighted
-annual import of a group of carriers. This module owns everything about axes
-that does not need the optimization model: the Axis type, the parsing and
-validation of the include/exclude config lists, and the physical-unit lookup
-for the polytope metadata. Model-coupled axis logic lives in plugin.MGA.
+An axis is one coordinate of the explored near-optimal space: the summed
+capacity addition of a group of technologies, the duration-weighted annual
+import of a group of carriers, or the total system cost. This module owns
+everything about axes that does not need the optimization model: the Axis
+type, the parsing and validation of the axis config lists, and the
+physical-unit lookup for the polytope metadata. Model-coupled axis logic
+lives in plugin.MGA.
 """
 
 from dataclasses import dataclass
 
 import numpy as np
 
-from .polytope_io import TECH_CAPACITY
+from .polytope_io import CARRIER_IMPORT, TECH_CAPACITY, TOTAL_COST
 
 
 @dataclass(frozen=True)
@@ -21,9 +22,10 @@ class Axis:
 
     TECH_CAPACITY axes sum capacity_addition over the member technologies,
     restricted to the selected capacity type; CARRIER_IMPORT axes sum the
-    duration-weighted annual flow_import over the member carriers.
+    duration-weighted annual flow_import over the member carriers; the single
+    TOTAL_COST axis is the model's net present cost and has no members.
     capacity_type is the "+"-joined selected type(s) for tech axes and None
-    for carrier axes.
+    otherwise.
     """
 
     name: str
@@ -32,47 +34,33 @@ class Axis:
     capacity_type: str | None
 
 
-def build_axis_groups(include_techs, exclude_techs, include_carrier_imports,
-                      technologies, carriers):
+def build_axis_groups(technologies, carrier_imports, all_technologies,
+                      all_carriers):
     """Turn the axis config lists into ordered (name, members) groups.
 
-    Returns (tech_groups, carrier_groups). Tech axes follow the user's
-    include_techs order; the exclude_techs path instead yields singleton axes
-    in model order for every technology not excluded.
+    Returns (tech_groups, carrier_groups), each in the user's order.
     """
-    include_techs = list(include_techs or [])
-    exclude_techs = list(exclude_techs or [])
-    include_carrier_imports = list(include_carrier_imports or [])
-    tech_set, carrier_set = set(technologies), set(carriers)
-
-    if include_techs and exclude_techs:
-        raise ValueError("MGA: include_techs and exclude_techs are mutually exclusive.")
-
-    if include_techs:
-        tech_groups = _parse_axis_list(include_techs, tech_set, tech_set,
-                                       "include_techs")
-    else:
-        excluded = set(exclude_techs)
-        unknown = excluded - tech_set
-        if unknown:
-            raise KeyError(f"MGA exclude_techs: unknown technologies {sorted(unknown)}")
-        tech_groups = [(t, [t]) for t in technologies if t not in excluded]
-
+    tech_set, carrier_set = set(all_technologies), set(all_carriers)
+    tech_groups = _parse_axis_list(
+        technologies, tech_set, tech_set, "axes.technologies"
+    )
     # Axis names share one namespace with the model names in the polytope
     # file, so carrier groups must not reuse a technology or carrier name.
-    carrier_groups = _parse_axis_list(include_carrier_imports, carrier_set,
-                                      tech_set | carrier_set,
-                                      "include_carrier_imports")
-
+    carrier_groups = _parse_axis_list(
+        carrier_imports, carrier_set, tech_set | carrier_set,
+        "axes.carrier_imports",
+    )
     duplicates = {n for n, _ in tech_groups} & {n for n, _ in carrier_groups}
     if duplicates:
-        raise ValueError(f"MGA: axis name(s) {sorted(duplicates)} used for both "
-                         f"a tech and a carrier axis.")
+        raise ValueError(
+            f"MGA: axis name(s) {sorted(duplicates)} used for both a "
+            f"technology and a carrier axis."
+        )
     return tech_groups, carrier_groups
 
 
 def _parse_axis_list(entries, valid_members, reserved_names, label):
-    """Parse one include_* config list into ordered (name, members) tuples.
+    """Parse one axis config list into ordered (name, members) tuples.
 
     Each entry is an axis name (singleton axis) or a single-key dict
     ``{group_name: [member, ...]}`` (lumped axis). Axis names must be unique,
@@ -83,7 +71,7 @@ def _parse_axis_list(entries, valid_members, reserved_names, label):
     seen_names = set()
     axis_of_member = {}
     unknown = []
-    for entry in entries:
+    for entry in entries or []:
         if isinstance(entry, str):
             name, members = entry, [entry]
         elif isinstance(entry, dict) and len(entry) == 1:
@@ -129,14 +117,23 @@ def _find_level(index, needle):
     return next((lvl for lvl in index.names if needle in lvl), None)
 
 
-def axis_physical_unit(axis, units, ureg):
-    """Physical unit string of one axis value, or None if unit tracking is off.
+def axis_physical_unit(axis, units, ureg, cost_variable="net_present_cost"):
+    """Physical unit string of one axis value, or None if unavailable.
 
     Tech axes read the capacity_addition unit at the selected capacity type;
-    carrier axes annualise the instantaneous flow_import unit (x hour).
-    Heterogeneous lumps yield a ' + '-joined string.
+    carrier axes annualise the instantaneous flow_import unit (x hour); the
+    cost axis reads the cost variable's unit. Heterogeneous lumps yield a
+    ' + '-joined string. `units` is the model's variable-unit mapping, which
+    is empty when unit tracking is switched off.
     """
     members = list(axis.members)
+    if axis.kind == TOTAL_COST:
+        series = units.get(cost_variable)
+        if series is None:
+            return None
+        found = sorted({str(u) for u in np.atleast_1d(np.asarray(series))})
+        return " + ".join(found) if found else None
+
     if axis.kind == TECH_CAPACITY:
         series = units.get("capacity_addition")
         if series is None:
@@ -150,6 +147,9 @@ def axis_physical_unit(axis, units, ureg):
                 .isin(axis.capacity_type.split("+")))
         found = sorted({str(u) for u in series[mask].to_numpy()})
         return " + ".join(found) if found else None
+
+    if axis.kind != CARRIER_IMPORT:
+        return None
     series = units.get("flow_import")
     if series is None:
         return None
@@ -164,12 +164,3 @@ def axis_physical_unit(axis, units, ureg):
         except Exception:
             annual.add(f"({unit}) * hour")
     return " + ".join(sorted(annual)) if annual else None
-
-
-def cost_physical_unit(units):
-    """Physical unit of net_present_cost (e.g. 'megaEuro'), or None."""
-    series = units.get("net_present_cost")
-    if series is None:
-        return None
-    found = sorted({str(u) for u in np.atleast_1d(np.asarray(series))})
-    return " + ".join(found) if found else None

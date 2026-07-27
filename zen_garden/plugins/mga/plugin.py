@@ -16,37 +16,41 @@ under one of two modes:
 Rolling-horizon runs are rejected: after_solve fires after the horizon loop,
 so the plugin would only see the final step's model.
 
-Oracle-mode exploration axes are groups of technologies (summed capacity
-addition) or carriers (duration-weighted annual import), see axes.py. All
-polytope coordinates are normalised: design axis i is z_i / U_i*, with U_i*
-from one fmax LP per axis, and the optional cost axis is
-(C - C*) / (epsilon * C*). Every solve is written to disk as a sibling
-sub-solution of the baseline via Postprocess.
+Glossary
+    axis        one exploratory variable, i.e. one coordinate of the explored
+                space: a technology-capacity group, a carrier-import group,
+                or the total cost (see axes.py)
+    n_z         number of axes, cost included -- the dimension of the
+                explored space
+    C* (c_star) the baseline (cost-optimal) net present cost
+    z*          the baseline design in axis coordinates
+    phys        physical units (GW, GWh, MEUR, ...)
+    norm        normalised coordinates: phys = norm * scale + offset, per
+                axis. Design axes use scale = upper bound and offset = 0, so
+                they reach 1 at their near-optimal maximum; the cost axis
+                uses scale = epsilon * C* and offset = C*, so 0 is the cost
+                optimum and 1 the budget.
 
-Config (the "plugins.mga" block in config.json):
+Every solve is written to disk as a sibling sub-solution of the baseline via
+Postprocess.
+
+Config (the "plugins.mga" block in config.json; unknown keys are rejected):
     epsilon (float): near-optimality slack, default 0.1.
     mode (str): "weights" (default) or "oracle".
     iterations (list[dict]): weights mode; one {"weights": {tech: w}} dict
         per iteration.
-    include_techs (list): tech axes; entries are technology names or
-        single-key dicts {group_name: [members]} for lumped axes. Mutually
-        exclusive with exclude_techs (singleton axes for every technology
-        not listed).
-    include_carrier_imports (list): carrier-import axes, same entry format.
+    axes (dict): oracle mode.
+        technologies (list): technology axes; entries are technology names or
+            single-key dicts {group_name: [members]} for lumped axes.
+        carrier_imports (list): carrier-import axes, same entry format.
+        include_cost (bool): add the total-cost axis. Default False.
     oracle (dict): tolerance (required), max_iterations (default 200),
-        formulation ("kkt_milp" | "dual_bilinear"), include_cost (bool),
-        vmm_initialization (bool, default False: complete the fmax LPs into
-        a full VMM pass -- additionally solve one fmin LP per axis, tighten
-        the initial outer box with the certified minima, and seed the
-        initial inner approximation with all 2*n_z extreme designs),
-        milp_options (Gurobi options for ORACLE's internal step-2 solves;
-        empty by default, so set at least a TimeLimit for production runs),
-        Md_override, t_max_override, use_bigM,
-        final_certificate_time_limit (seconds, 0 = off). See oracle_driver.py.
+        initial_bounds ("vmm" (default) or a dict {axis: [lower, upper]}
+        covering every design axis), step2 (dict). See oracle_driver.py.
 
-pyoNearOpt compatibility: "dual_bilinear" and a trustworthy metric under the
-SOS1 encoding need the patched pyoNearOpt; with the unpatched (base) package
-use formulation "kkt_milp" AND set use_bigM: true (see oracle_driver.py).
+pyoNearOpt compatibility: with the base (published) package only the default
+step-2 formulation "kkt_milp" exists, and it must be run with
+step2.use_bigM = true (see oracle_driver.py).
 """
 
 import logging
@@ -58,23 +62,37 @@ import xarray as xr
 from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.postprocess.postprocess import Postprocess
 
-from .axes import Axis, axis_physical_unit, build_axis_groups, cost_physical_unit
+from .axes import Axis, axis_physical_unit, build_axis_groups
 from .oracle_driver import run_oracle_mode
-from .polytope_io import CARRIER_IMPORT, TECH_CAPACITY
+from .polytope_io import CARRIER_IMPORT, TECH_CAPACITY, TOTAL_COST
 
 # Module-level config, updated by the plugin loader with the user's
 # "plugins.mga" block. The merge is a SHALLOW dict.update: nested dicts like
-# "oracle" are replaced wholesale, so their defaults must be applied at
-# access time via .get(), never stored here.
+# "axes" and "oracle" are replaced wholesale, so their defaults must be
+# applied at access time via .get(), never stored here.
 config = {
     "epsilon": 0.1,
     "mode": "weights",
-    "exclude_techs": [],
-    "include_techs": [],
-    "include_carrier_imports": [],
     "iterations": [],
+    "axes": {},
     "oracle": {},
 }
+
+# Recognised config keys per block; anything else is a typo or a stale key
+# from an older config and is rejected rather than silently ignored.
+_KNOWN_KEYS = {
+    "plugins.mga": {"epsilon", "mode", "iterations", "axes", "oracle"},
+    "plugins.mga.axes": {"technologies", "carrier_imports", "include_cost"},
+    "plugins.mga.oracle": {"tolerance", "max_iterations", "initial_bounds",
+                           "step2"},
+    "plugins.mga.oracle.step2": {"formulation", "use_bigM", "big_M", "t_max",
+                                 "solver_options", "certificate_time_limit"},
+}
+
+# The model variable behind the cost axis. objective_total_cost() is exactly
+# this variable summed over set_years, and it has no other dimension, so the
+# expression and the solution value below are the same quantity.
+COST_VARIABLE = "net_present_cost"
 
 # A cut returned by find_nearest_point must keep every known near-optimal
 # point inside the outer approximation; inexact projection duals (e.g.
@@ -97,6 +115,43 @@ def _scalar_da(value):
                         coords={_SCALAR_DIM: [0]})
 
 
+def normalise_rows(A, b):
+    """Scale every row of ``A z <= b`` to unit Euclidean length.
+
+    Each row is one half-space, and multiplying a row by a positive constant
+    leaves that half-space unchanged, so this alters the representation and
+    not the geometry. It is pyoNearOpt's convention for the cutting planes it
+    adds; applying it to the initial rows too gives the whole system one
+    scale, instead of rows carrying the physical magnitude of their axis.
+    """
+    A = np.asarray(A, dtype=float)
+    b = np.asarray(b, dtype=float)
+    norms = np.linalg.norm(A, axis=1)
+    norms = np.where(norms > 0.0, norms, 1.0)
+    return A / norms[:, None], b / norms
+
+
+def validate_config(cfg) -> None:
+    """Reject unknown keys in the plugin config.
+
+    Every setting is read with a default, so an unrecognised key (a typo, or
+    one renamed in an earlier version) would otherwise be ignored in silence
+    and the run would proceed on defaults.
+    """
+    for label, block in (
+        ("plugins.mga", cfg),
+        ("plugins.mga.axes", cfg.get("axes", {})),
+        ("plugins.mga.oracle", cfg.get("oracle", {})),
+        ("plugins.mga.oracle.step2", cfg.get("oracle", {}).get("step2", {})),
+    ):
+        unknown = sorted(set(block) - _KNOWN_KEYS[label])
+        if unknown:
+            raise ValueError(
+                f"Unknown MGA config key(s) in {label}: {unknown}. "
+                f"Known keys: {sorted(_KNOWN_KEYS[label])}."
+            )
+
+
 class MGA:
     """Near-optimal exploration on a solved ZEN-garden model.
 
@@ -113,8 +168,7 @@ class MGA:
     _CARRIER_AGG = ["set_carriers", "set_nodes", "set_time_steps_operation"]
 
     def __init__(self, optimization_setup, epsilon, postprocess_ctx,
-                 exclude_techs=None, include_techs=None,
-                 include_carrier_imports=None, include_cost=False):
+                 technologies=None, carrier_imports=None, include_cost=False):
         """
         Args:
             optimization_setup: OptimizationSetup holding the solved baseline
@@ -123,12 +177,9 @@ class MGA:
             postprocess_ctx: Dict of Postprocess arguments for the iteration
                 outputs (scenarios, subfolder, model_name, scenario_name,
                 param_map).
-            exclude_techs: Technologies dropped from the singleton tech axes.
-                Mutually exclusive with include_techs.
-            include_techs: Tech axes (names or {group: [members]} lumps).
-            include_carrier_imports: Carrier-import axes, same format.
-            include_cost: Add a normalised total-cost coordinate to the
-                exploration space (oracle mode only).
+            technologies: Technology axes (names or {group: [members]} lumps).
+            carrier_imports: Carrier-import axes, same format.
+            include_cost: Add the total-cost axis (oracle mode only).
         """
         if epsilon <= 0:
             raise ValueError(f"MGA epsilon must be positive, got {epsilon!r}")
@@ -136,29 +187,16 @@ class MGA:
         self.model = optimization_setup.model
         self.epsilon = epsilon
         self.postprocess_ctx = postprocess_ctx
-        self.include_cost = include_cost
         # Baseline objective C*, captured before MGA touches the model.
         self.c_star = self.model.objective.value
 
-        self.cap_add = self.model.variables["capacity_addition"]
+        self.capacity_addition = self.model.variables["capacity_addition"]
         # Selects the capacity type each axis aggregates per technology.
         self._capacity_mask = self._build_capacity_type_mask()
 
-        # Normalisation state, set once by compute_fmax_normalization().
-        self.u_star = None
-        self._u_tilde = None
-        self._offset = None
-        # Per-axis near-optimal minima from the fmin LPs (VMM only); None
-        # keeps the initial outer box's lower bounds at 0.
-        self.l_star = None
-        # Raw exploration vectors of the extreme (fmax/fmin) designs,
-        # collected by solve_extreme_lps for the VMM initialisation.
-        self._extreme_designs_raw = []
-        # Known near-optimal points in explore coordinates; backs the
-        # cut-validity guard in find_nearest_point (seeded with z*).
-        self._inner_points = None
-
-        all_techs = list(self.cap_add.coords["set_technologies"].values)
+        all_technologies = list(
+            self.capacity_addition.coords["set_technologies"].values
+        )
         if "flow_import" in self.model.variables:
             all_carriers = list(
                 self.model.variables["flow_import"].coords["set_carriers"].values
@@ -166,12 +204,12 @@ class MGA:
         else:
             all_carriers = []
         tech_groups, carrier_groups = build_axis_groups(
-            include_techs, exclude_techs, include_carrier_imports,
-            all_techs, all_carriers,
+            technologies, carrier_imports, all_technologies, all_carriers
         )
 
         # The single source of truth for axis order everywhere downstream
-        # (z, mu, name_list): tech axes first, then carrier axes.
+        # (coordinates, cut normals, polytope columns): technology axes, then
+        # carrier axes, then the cost axis.
         self.axes: list[Axis] = [
             Axis(name, TECH_CAPACITY, tuple(members),
                  self._selected_capacity_type(name, members))
@@ -180,6 +218,8 @@ class MGA:
             Axis(name, CARRIER_IMPORT, tuple(members), None)
             for name, members in carrier_groups
         ]
+        if include_cost:
+            self.axes.append(Axis(COST_VARIABLE, TOTAL_COST, (), None))
         self.z_names = [axis.name for axis in self.axes]
         self.n_z = len(self.axes)
 
@@ -193,13 +233,35 @@ class MGA:
             self.flow_import = None
             self._ts_duration = None
 
-        # Baseline design vector z*, read now while the baseline solution is
-        # still loaded (the fmax LPs overwrite it).
-        self.z_star_raw = np.array(
-            [self._axis_value(axis) for axis in self.axes], dtype=float
+        # Normalisation state, set once by solve_axis_bounds().
+        self.bounds_phys = None
+        self.scale = None
+        self.offset = None
+        self.n_initial_rows = None
+        # (origin label, physical point) per extreme design found by the
+        # bound LPs; they seed the initial inner approximation.
+        self._extreme_designs = []
+        # Known near-optimal points in normalised coordinates; backs the
+        # cut-validity guard in find_nearest_point.
+        self._inner_points = None
+
+        # Baseline point z*, read now while the baseline solution is still
+        # loaded (the bound LPs overwrite it).
+        self.z_star_phys = np.array(
+            [self.axis_value(axis) for axis in self.axes], dtype=float
         )
 
         self._iter_count = 0
+
+    @property
+    def design_axes(self) -> list[Axis]:
+        """The axes whose bounds come from the model (everything but cost)."""
+        return [axis for axis in self.axes if axis.kind != TOTAL_COST]
+
+    @property
+    def include_cost(self) -> bool:
+        """Whether the exploration carries the total-cost axis."""
+        return any(axis.kind == TOTAL_COST for axis in self.axes)
 
     def setup(self):
         """Add the near-optimality cost constraint. Call exactly once per run."""
@@ -232,7 +294,7 @@ class MGA:
         """
         weight_array = self._build_weight_array(weights)
         self.model.add_objective(
-            (weight_array * self._capacity_mask * self.cap_add).sum(),
+            (weight_array * self._capacity_mask * self.capacity_addition).sum(),
             sense="min", overwrite=True,
         )
         logging.info(f"MGA iter {iter_id}: weights = {weights}")
@@ -242,9 +304,10 @@ class MGA:
         """Weights as a DataArray over the full set_technologies coordinate.
 
         Unlisted technologies get weight 0 (unknown names raise KeyError);
-        (w * cap_add).sum() then aggregates the remaining dims by broadcasting.
+        the product with capacity_addition then aggregates the remaining dims
+        by broadcasting.
         """
-        tech_coord = self.cap_add.coords["set_technologies"]
+        tech_coord = self.capacity_addition.coords["set_technologies"]
         weight_array = xr.DataArray(
             np.zeros(tech_coord.size),
             dims=("set_technologies",),
@@ -258,11 +321,6 @@ class MGA:
     # oracle mode: axes on the model
     # ------------------------------------------------------------------
 
-    @property
-    def n_explore(self) -> int:
-        """Dimension of the exploration space (n_z design axes + optional cost)."""
-        return self.n_z + (1 if self.include_cost else 0)
-
     def _build_capacity_type_mask(self):
         """0/1 mask over (set_technologies, set_capacity_types): the capacity
         type each axis aggregates per technology.
@@ -274,11 +332,13 @@ class MGA:
         system.set_capacity_types[0] by ZEN-garden convention.
         """
         type_dim = "set_capacity_types"
-        other_dims = [d for d in self.cap_add.dims
+        other_dims = [d for d in self.capacity_addition.dims
                       if d not in ("set_technologies", type_dim)]
-        active = (self.cap_add.labels != -1).any(other_dims)
+        active = (self.capacity_addition.labels != -1).any(other_dims)
         power_type = str(self.optimization_setup.system.set_capacity_types[0])
-        if power_type not in [str(c) for c in self.cap_add.coords[type_dim].values]:
+        known_types = [str(c) for c in
+                       self.capacity_addition.coords[type_dim].values]
+        if power_type not in known_types:
             raise RuntimeError(
                 f"MGA: power capacity type {power_type!r} not found in "
                 f"capacity_addition."
@@ -325,12 +385,12 @@ class MGA:
             )
         return "+".join(types)
 
-    def _axis_expression(self, axis: Axis, capacity, flow):
-        """One axis value as an expression over `capacity`/`flow` data.
+    def _design_axis_terms(self, axis: Axis, capacity, flow):
+        """One design axis over `capacity`/`flow` data.
 
-        `capacity` and `flow` are either the linopy variables (yielding the
-        axis LinearExpression) or their `.solution` arrays (yielding the
-        axis value): tech axes sum the capacity addition of the member
+        The arguments are either the linopy variables (yielding the axis
+        LinearExpression) or their `.solution` arrays (yielding the axis
+        value): technology axes sum the capacity addition of the member
         technologies, restricted by the capacity-type mask; carrier axes sum
         the duration-weighted annual import of the member carriers,
         sum_{m,n,t} tau_t * flow[m, n, t].
@@ -347,42 +407,45 @@ class MGA:
             .sum(self._CARRIER_AGG)
         )
 
-    def _axis_linexpr(self, axis: Axis):
-        """Linopy expression of one axis (fmax objective, projection equality)."""
-        return self._axis_expression(axis, self.cap_add, self.flow_import)
-
-    def _axis_value(self, axis: Axis) -> float:
-        """Value of one axis on the currently loaded solution."""
-        flow = None if self.flow_import is None else self.flow_import.solution
-        return float(self._axis_expression(axis, self.cap_add.solution, flow))
-
-    def _to_explore_coords(self, z_design_raw, c_raw=None) -> np.ndarray:
-        """Affine map from raw (design[, cost]) values to normalised ORACLE
-        coordinates: z_i / U_i*, and (C - C*) / (epsilon * C*) for the cost
-        axis."""
-        assert self._u_tilde is not None, "compute_fmax_normalization() must run first"
-        raw = np.asarray(z_design_raw, dtype=float)
-        if self.include_cost:
-            raw = np.append(raw, float(c_raw))
-        return (raw - self._offset) / self._u_tilde
-
-    def _extract_z(self) -> np.ndarray:
-        """Exploration vector of the most recent solve, normalised, in
-        canonical axis order (cost appended last when include_cost)."""
-        z_design_raw = np.array(
-            [self._axis_value(axis) for axis in self.axes], dtype=float
+    def axis_expression(self, axis: Axis):
+        """Linopy expression of one axis (bound LP objective, projection)."""
+        if axis.kind == TOTAL_COST:
+            return self._total_cost_expression()
+        return self._design_axis_terms(
+            axis, self.capacity_addition, self.flow_import
         )
-        c_raw = None
-        if self.include_cost:
-            c_raw = float(self.model.variables["net_present_cost"].solution.sum())
-        return self._to_explore_coords(z_design_raw, c_raw)
+
+    def axis_value(self, axis: Axis) -> float:
+        """Value of one axis on the currently loaded solution."""
+        if axis.kind == TOTAL_COST:
+            return float(self.model.variables[COST_VARIABLE].solution.sum())
+        flow = None if self.flow_import is None else self.flow_import.solution
+        return float(self._design_axis_terms(
+            axis, self.capacity_addition.solution, flow
+        ))
+
+    # ------------------------------------------------------------------
+    # oracle mode: coordinates
+    # ------------------------------------------------------------------
+
+    def to_norm(self, point_phys) -> np.ndarray:
+        """Physical point -> normalised coordinates."""
+        assert self.scale is not None, "solve_axis_bounds() must run first"
+        return (np.asarray(point_phys, dtype=float) - self.offset) / self.scale
+
+    def to_phys(self, point_norm) -> np.ndarray:
+        """Normalised point -> physical coordinates."""
+        assert self.scale is not None, "solve_axis_bounds() must run first"
+        return np.asarray(point_norm, dtype=float) * self.scale + self.offset
+
+    def current_point_norm(self) -> np.ndarray:
+        """The most recent solve as a normalised point, in axis order."""
+        return self.to_norm([self.axis_value(axis) for axis in self.axes])
 
     @property
-    def z_star_explore(self) -> np.ndarray:
-        """Baseline point z* in normalised coordinates (design vector frozen
-        in __init__; the baseline cost is exactly C*, so the cost coordinate
-        is exactly 0)."""
-        return self._to_explore_coords(self.z_star_raw, self.c_star)
+    def z_star_norm(self) -> np.ndarray:
+        """The baseline point z* in normalised coordinates."""
+        return self.to_norm(self.z_star_phys)
 
     def polytope_metadata(self) -> dict:
         """Self-describing metadata for the saved polytope: per-axis kind,
@@ -390,83 +453,134 @@ class MGA:
         convention (schema owned by polytope_io)."""
         units = self.optimization_setup.variables.units
         ureg = self.optimization_setup.energy_system.unit_handling.ureg
-        axes_meta = [
-            {
-                "name": axis.name,
-                "kind": axis.kind,
-                "members": list(axis.members),
-                "capacity_type": axis.capacity_type,
-                "unit": axis_physical_unit(axis, units, ureg),
-            }
-            for axis in self.axes
-        ]
         return {
-            "axes": axes_meta,
-            "cost_axis": "net_present_cost" if self.include_cost else None,
-            "cost_unit": cost_physical_unit(units) if self.include_cost else None,
-            "include_cost": bool(self.include_cost),
+            "axes": [
+                {
+                    "name": axis.name,
+                    "kind": axis.kind,
+                    "members": list(axis.members),
+                    "capacity_type": axis.capacity_type,
+                    "unit": axis_physical_unit(axis, units, ureg,
+                                               cost_variable=COST_VARIABLE),
+                }
+                for axis in self.axes
+            ],
             "normalisation": (
-                "design axis i: z_i / u_star[i]; "
-                "cost axis (if present): (C - c_star) / (epsilon * c_star)"
+                "physical = normalised * scale + offset, per axis; design "
+                "axes use (upper bound, 0), the cost axis (epsilon * c_star, "
+                "c_star)"
             ),
         }
 
     # ------------------------------------------------------------------
-    # oracle mode: normalisation, projection model, ORACLE callback
+    # oracle mode: bounds, projection model, ORACLE callback
     # ------------------------------------------------------------------
 
-    def compute_fmax_normalization(self) -> None:
-        """Set the normalisation from the fmax LPs (see solve_extreme_lps).
+    def solve_axis_bounds(self, supplied_bounds=None) -> None:
+        """Determine the per-axis bounds and the normalisation they define.
 
-        The per-axis maxima U_i* are the normalisation denominators
-        (z_i / U_i*) and the upper bounds of the initial outer box. Sets
-        u_star and the augmented scale/offset; call after setup().
+        With `supplied_bounds` None this is a full VMM (variable min/max)
+        pass: two LPs per design axis drive it to its near-optimal minimum
+        and maximum, which yields certified bounds and, as a by-product, the
+        2 * n_design extreme designs that seed the inner approximation. A
+        supplied dict {axis: [lower, upper]} must cover every design axis and
+        replaces those LPs entirely, so the bounds are as good as the caller's
+        claim and no extreme designs are available.
+
+        The cost axis is never solved for: the near-optimality constraint
+        defines its bounds as [C*, (1 + epsilon) * C*] exactly.
+
+        Sets bounds_phys, scale and offset; call after setup().
         """
-        self.u_star = self.solve_extreme_lps("max")
-        bad = [name for name, u in zip(self.z_names, self.u_star, strict=True)
-               if not np.isfinite(u) or u <= 0]
-        if bad:
-            raise RuntimeError(
-                f"MGA fmax: U* <= 0 for axes {bad}; cannot serve as "
-                f"normalisation denominators -- remove them from the config."
+        if supplied_bounds is None:
+            upper = self.solve_extreme_lps("max")
+            lower = self.solve_extreme_lps("min")
+        else:
+            lower, upper = self._read_supplied_bounds(supplied_bounds)
+        # Axis values are sums of non-negative variables, so a negative
+        # minimum can only be solver round-off.
+        lower = np.maximum(0.0, lower)
+
+        bounds, scale, offset = [], [], []
+        design_index = 0
+        for axis in self.axes:
+            if axis.kind == TOTAL_COST:
+                lo, hi = self.c_star, (1.0 + self.epsilon) * self.c_star
+                # 0 is the cost optimum, 1 the near-optimality budget.
+                bounds.append((lo, hi))
+                scale.append(hi - lo)
+                offset.append(lo)
+                continue
+            lo, hi = float(lower[design_index]), float(upper[design_index])
+            design_index += 1
+            if not np.isfinite(hi) or hi <= 0:
+                raise RuntimeError(
+                    f"MGA: upper bound {hi:.6g} of axis {axis.name!r} cannot "
+                    f"serve as a normalisation denominator; remove the axis "
+                    f"or supply a positive bound."
+                )
+            if lo > hi:
+                raise RuntimeError(
+                    f"MGA: axis {axis.name!r} has lower bound {lo:.6g} above "
+                    f"upper bound {hi:.6g}."
+                )
+            # The axis reaches 1 at its near-optimal maximum.
+            bounds.append((lo, hi))
+            scale.append(hi)
+            offset.append(0.0)
+
+        self.bounds_phys = np.array(bounds, dtype=float)
+        self.scale = np.array(scale, dtype=float)
+        self.offset = np.array(offset, dtype=float)
+        logging.info(
+            f"MGA bounds: {self.n_z} axes ready "
+            f"({'supplied' if supplied_bounds else 'VMM LPs'}); normalised "
+            f"lower bounds "
+            f"{np.round((self.bounds_phys[:, 0] - self.offset) / self.scale, 4)}"
+        )
+
+    def _read_supplied_bounds(self, supplied_bounds):
+        """Validate a user-supplied bounds dict and return (lower, upper)."""
+        if not isinstance(supplied_bounds, dict):
+            raise ValueError(
+                f"MGA initial_bounds must be 'vmm' or a dict of "
+                f"{{axis: [lower, upper]}}, got {type(supplied_bounds).__name__}."
             )
-
-        # Augmented scale/offset: design axes (U_i*, 0); the cost axis, when
-        # present, (epsilon * C*, C*).
-        scale = list(self.u_star)
-        offset = [0.0] * self.n_z
-        if self.include_cost:
-            scale.append(self.epsilon * self.c_star)
-            offset.append(self.c_star)
-        self._u_tilde = np.array(scale, dtype=float)
-        self._offset = np.array(offset, dtype=float)
-
-    def compute_fmin_bounds(self) -> None:
-        """Set tight lower bounds of the initial outer box from the fmin LPs
-        (see solve_extreme_lps); the minimising designs double as initial
-        inner points.
-
-        Clamped at 0 against solver round-off (axis values are sums of
-        non-negative variables). A lower bound is only valid at a proven
-        minimum, which solve_extreme_lps enforces.
-        """
-        self.l_star = np.maximum(0.0, self.solve_extreme_lps("min"))
+        design_names = [axis.name for axis in self.design_axes]
+        missing = [name for name in design_names if name not in supplied_bounds]
+        unknown = sorted(set(supplied_bounds) - set(design_names))
+        if missing or unknown:
+            raise ValueError(
+                f"MGA initial_bounds must cover every design axis exactly; "
+                f"missing {missing}, unknown {unknown}."
+            )
+        lower, upper = [], []
+        for name in design_names:
+            pair = supplied_bounds[name]
+            if len(pair) != 2:
+                raise ValueError(
+                    f"MGA initial_bounds[{name!r}] must be [lower, upper], "
+                    f"got {pair!r}."
+                )
+            lower.append(float(pair[0]))
+            upper.append(float(pair[1]))
+        return np.array(lower), np.array(upper)
 
     def solve_extreme_lps(self, sense: str) -> np.ndarray:
-        """Drive every axis to its near-optimal extreme: one LP per axis with
-        the axis value as objective (sense "max" or "min" -- together the two
-        halves of VMM, variable min/max).
+        """Drive every design axis to one near-optimal extreme.
 
-        Each LP must reach a proven optimum ("unbounded" on a max means the
-        axis has no finite near-optimal maximum). Every solution is saved via
-        Postprocess as <model_name>_f<sense>_<axis> and recorded as an
-        extreme design for the VMM initialisation. Returns the per-axis
-        extreme values.
+        One LP per design axis with the axis value as objective, `sense`
+        being "max" or "min" -- the two halves of VMM. Each LP must reach a
+        proven optimum: an outer bound derived from an unconverged solve
+        would not be valid ("unbounded" on a max means the axis has no finite
+        near-optimal maximum). Every solution is written via Postprocess as
+        <model_name>_f<sense>_<axis> and recorded as an extreme design.
+        Returns the extreme values in design-axis order.
         """
         values = []
-        for axis in self.axes:
+        for axis in self.design_axes:
             self.model.add_objective(
-                self._axis_linexpr(axis), sense=sense, overwrite=True
+                self.axis_expression(axis), sense=sense, overwrite=True
             )
             start = time.time()
             self.optimization_setup.solve()
@@ -476,71 +590,62 @@ class MGA:
                     f"{self.model.termination_condition!r}."
                 )
             self._postprocess(f"f{sense}_{axis.name}")
-            value = self._axis_value(axis)
-            values.append(value)
-            self._collect_extreme_design()
+            values.append(self.axis_value(axis))
+            self._extreme_designs.append((
+                f"{sense}:{axis.name}",
+                np.array([self.axis_value(a) for a in self.axes], dtype=float),
+            ))
             logging.info(
-                f"MGA f{sense}: {axis.name} = {value:.6g} "
+                f"MGA f{sense}: {axis.name} = {values[-1]:.6g} "
                 f"(LP took {time.time() - start:.1f} s)"
             )
         return np.array(values, dtype=float)
 
-    def _collect_extreme_design(self) -> None:
-        """Record the loaded solution's raw exploration vector."""
-        z_raw = np.array([self._axis_value(a) for a in self.axes], dtype=float)
-        c_raw = float(self.model.variables["net_present_cost"].solution.sum())
-        self._extreme_designs_raw.append((z_raw, c_raw))
+    def initial_inner_points(self) -> tuple[np.ndarray, list[str]]:
+        """The certified points seeding the inner approximation.
 
-    def initial_inner_points(self, include_extreme_designs: bool) -> np.ndarray:
-        """Certified near-optimal points seeding the inner approximation.
-
-        Always contains z* (row 0); with include_extreme_designs also every
-        design collected by solve_extreme_lps (the VMM initialisation).
-        Rows are in normalised explore coordinates.
+        Returns (X0, origins): the baseline z* followed by every extreme
+        design found by the bound LPs, in normalised coordinates, with a
+        provenance label per row.
         """
-        points = [self.z_star_explore]
-        if include_extreme_designs:
-            points += [self._to_explore_coords(z, c)
-                       for z, c in self._extreme_designs_raw]
-        return np.vstack(points)
+        points = [self.z_star_norm]
+        origins = ["z_star"]
+        for label, point_phys in self._extreme_designs:
+            points.append(self.to_norm(point_phys))
+            origins.append(label)
+        return np.vstack(points), origins
 
     def build_initial_outer_approximation(self) -> tuple[np.ndarray, np.ndarray]:
         """(A0, b0) of the initial outer polytope in normalised coordinates.
 
-        Raw rows per design axis: -z_i <= -L_i and z_i <= U_i*, both tight
-        (L_i = 0 unless the fmin LPs ran; axis values are sums of
-        non-negative variables, so 0 is always a valid lower bound); plus
-        C* <= C <= (1 + epsilon) * C* when include_cost. Each raw row
-        a^T z_raw <= b is then mapped to normalised coordinates via
-        z_raw = offset + diag(u_tilde) z_norm, i.e. it becomes
-        (a o u_tilde)^T z_norm <= b - a^T offset.
+        Two rows per axis, lower and upper, uniformly for design and cost
+        axes: -z_i <= -lower_i and z_i <= upper_i in physical units. Each raw
+        row a^T z_phys <= b maps to normalised coordinates via
+        z_phys = offset + diag(scale) z_norm, i.e. it becomes
+        (a o scale)^T z_norm <= b - a^T offset, and the rows are then scaled
+        to unit length (see normalise_rows). The result is exactly the box
+        lower_i/upper_i <= z_norm,i <= 1 for design axes and 0 <= z_norm <= 1
+        for the cost axis.
         """
         n_z = self.n_z
         A0 = np.vstack([-np.eye(n_z), np.eye(n_z)])
-        lower = self.l_star if self.l_star is not None else np.zeros(n_z)
-        b0 = np.concatenate([-lower, self.u_star])
-        if self.include_cost:
-            A0 = np.hstack([A0, np.zeros((A0.shape[0], 1))])
-            cost_row = np.zeros((1, n_z + 1))
-            cost_row[0, n_z] = 1.0
-            A0 = np.vstack([A0, cost_row, -cost_row])
-            b0 = np.concatenate(
-                [b0, [(1.0 + self.epsilon) * self.c_star], [-self.c_star]]
-            )
+        b0 = np.concatenate([-self.bounds_phys[:, 0], self.bounds_phys[:, 1]])
 
-        b0 = b0 - A0 @ self._offset  # must precede the column scaling below
-        A0 = A0 @ np.diag(self._u_tilde)
+        b0 = b0 - A0 @ self.offset  # must precede the column scaling below
+        A0 = A0 @ np.diag(self.scale)
+        A0, b0 = normalise_rows(A0, b0)
 
         # Sanity check: z* must satisfy the initial outer approximation.
-        violation = A0 @ self.z_star_explore - b0
+        violation = A0 @ self.z_star_norm - b0
         if (violation > 1e-6 * (np.abs(b0) + 1.0)).any():
             raise RuntimeError(
                 f"MGA: initial outer approximation excludes z* "
                 f"(max violation {violation.max():.3g})."
             )
+        self.n_initial_rows = A0.shape[0]
         logging.info(
-            f"MGA outer approximation: {A0.shape[0]} rows, {A0.shape[1]} "
-            f"normalised axes (include_cost = {self.include_cost})."
+            f"MGA outer approximation: {A0.shape[0]} unit-norm rows over "
+            f"{n_z} normalised axes."
         )
         return A0, b0
 
@@ -570,17 +675,16 @@ class MGA:
     def setup_projection_model(self, initial_points=None) -> None:
         """Add the L-infinity projection model to the linopy model; call once.
 
-        Variables: delta (one entry per design axis on Z_DIM), a scalar t,
-        and, with include_cost, a scalar delta_cost sharing t. Constraints:
-        one projection equality per axis, axis_expr_i - delta_i == trial_i
-        (RHS updated per iteration in find_nearest_point), and scaled
-        t-bounds |delta_i| / U_i* <= t (plus |delta_cost| / (epsilon C*)
-        <= t), so that min t is the normalised L-infinity distance to the
-        trial point.
+        Variables: delta (one entry per axis on Z_DIM) and a scalar t.
+        Constraints: one projection equality per axis,
+        axis_expr_i - delta_i == trial_i (the right-hand side is updated per
+        iteration in find_nearest_point), and the scaled t-bounds
+        |delta_i| / scale_i <= t, so that min t is the normalised
+        L-infinity distance to the trial point.
 
-        `initial_points` (rows in explore coordinates) seeds the cut-validity
-        guard; it defaults to z* alone and should match the X handed to
-        ORACLE.
+        `initial_points` (rows in normalised coordinates) seeds the
+        cut-validity guard; it defaults to z* alone and should match the X
+        handed to ORACLE.
         """
         z_coord = xr.DataArray(
             np.array(self.z_names), dims=Z_DIM, coords={Z_DIM: self.z_names}
@@ -595,12 +699,13 @@ class MGA:
 
         for i, axis in enumerate(self.axes):
             self.model.add_constraints(
-                self._axis_linexpr(axis) - self.delta.sel({Z_DIM: axis.name}) == 0.0,
+                self.axis_expression(axis)
+                - self.delta.sel({Z_DIM: axis.name}) == 0.0,
                 name=f"mga_oracle_proj_eq_axis{i}",
             )
 
         d_scale = xr.DataArray(
-            1.0 / self.u_star, dims=Z_DIM, coords={Z_DIM: self.z_names}
+            1.0 / self.scale, dims=Z_DIM, coords={Z_DIM: self.z_names}
         )
         self.model.add_constraints(
             d_scale * self.delta - self.t_var <= 0, name="mga_oracle_t_pos"
@@ -609,32 +714,12 @@ class MGA:
             -(d_scale * self.delta) - self.t_var <= 0, name="mga_oracle_t_neg"
         )
 
-        if self.include_cost:
-            self.delta_cost = self.model.add_variables(
-                coords=[_scalar_da(0)], name="mga_oracle_delta_cost",
-                lower=-np.inf, upper=np.inf,
-            )
-            self.model.add_constraints(
-                self._total_cost_expression() - self.delta_cost == _scalar_da(0.0),
-                name="mga_oracle_proj_eq_cost",
-            )
-            c_scale = 1.0 / (self.epsilon * self.c_star)
-            self.model.add_constraints(
-                c_scale * self.delta_cost - self.t_var <= 0,
-                name="mga_oracle_t_pos_cost",
-            )
-            self.model.add_constraints(
-                -(c_scale * self.delta_cost) - self.t_var <= 0,
-                name="mga_oracle_t_neg_cost",
-            )
-
         # Seed the cut-validity guard with the initial inner points.
         if initial_points is None:
-            initial_points = [self.z_star_explore]
+            initial_points = [self.z_star_norm]
         self._inner_points = [np.asarray(p, dtype=float) for p in initial_points]
         logging.info(
             f"MGA oracle: projection model added (n_z = {self.n_z}, "
-            f"include_cost = {self.include_cost}, "
             f"{len(self._inner_points)} initial inner point(s))"
         )
 
@@ -642,30 +727,24 @@ class MGA:
         """pyoNearOpt callback: project one trial point onto the near-optimal
         space and return it with its supporting cut.
 
-        `trial_point` arrives in normalised coordinates (cost coordinate
-        last when include_cost). Returns (z_feas, dist, mu_cut, b_cut, 0) in
-        the same coordinates: dist = t* is the normalised L-infinity
-        distance, mu_cut is the dual of the projection equalities rescaled
-        into normalised coordinates (mu_raw o u_tilde; the affine cost
-        offset cancels), and b_cut = mu_cut @ z_feas -- possibly relaxed by
-        the cut-validity guard (CUT_GUARD_TRIGGER). The plane's scaling is
-        left to pyoNearOpt, which normalises every cut it accepts.
+        `trial_point` arrives in normalised coordinates. Returns
+        (z_feas, dist, mu_cut, b_cut, 0) in the same coordinates: dist = t*
+        is the normalised L-infinity distance, mu_cut is the dual of the
+        projection equalities rescaled into normalised coordinates
+        (mu_phys o scale; the affine offset cancels), and
+        b_cut = mu_cut @ z_feas -- possibly relaxed by the cut-validity guard
+        (CUT_GUARD_TRIGGER). The plane's scaling is left to pyoNearOpt, which
+        normalises every cut it accepts.
         """
-        assert trial_point.shape == (self.n_explore,), (
-            f"trial point shape {trial_point.shape}, expected ({self.n_explore},)"
+        assert trial_point.shape == (self.n_z,), (
+            f"trial point shape {trial_point.shape}, expected ({self.n_z},)"
         )
 
-        # Projection-equality RHS <- trial point in raw coordinates.
-        trial_design_raw = trial_point[:self.n_z] * self.u_star
+        # Projection-equality RHS <- the trial point in physical coordinates.
+        trial_phys = self.to_phys(trial_point)
         for i in range(self.n_z):
             self.model.constraints[f"mga_oracle_proj_eq_axis{i}"].rhs = float(
-                trial_design_raw[i]
-            )
-        if self.include_cost:
-            trial_c = float(trial_point[self.n_z])
-            trial_c_raw = self.c_star + trial_c * self.epsilon * self.c_star
-            self.model.constraints["mga_oracle_proj_eq_cost"].rhs = _scalar_da(
-                trial_c_raw
+                trial_phys[i]
             )
 
         # min t; .sum() collapses the trivial scalar dim for the objective.
@@ -699,24 +778,19 @@ class MGA:
                 self._iter_count += 1
                 return z_prev, 0.0, None, None, 0
 
-        z_feas = self._extract_z()
+        z_feas = self.current_point_norm()
         dist = float(self.t_var.solution.values[0])
 
         # Cut normal: duals of the projection equalities, rescaled into
         # normalised coordinates.
-        mu_design_raw = np.array(
+        mu_phys = np.array(
             [
                 float(self.model.constraints[f"mga_oracle_proj_eq_axis{i}"].dual.values)
                 for i in range(self.n_z)
             ],
             dtype=float,
         )
-        mu_cut = mu_design_raw * self.u_star
-        if self.include_cost:
-            mu_c_raw = float(
-                self.model.constraints["mga_oracle_proj_eq_cost"].dual.values[0]
-            )
-            mu_cut = np.append(mu_cut, mu_c_raw * self.epsilon * self.c_star)
+        mu_cut = mu_phys * self.scale
         b_cut = float(mu_cut @ z_feas)
 
         # Cut-validity guard: a valid supporting hyperplane keeps every known
@@ -763,6 +837,7 @@ def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
 
     Returns the oracle summary directory (oracle mode) or None.
     """
+    validate_config(config)
     mode = config["mode"]
     if mode not in ("weights", "oracle"):
         raise ValueError(f"Unknown MGA mode: {mode!r}. Expected 'weights' or 'oracle'.")
@@ -775,7 +850,7 @@ def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
     if mode == "weights" and not config["iterations"]:
         logging.warning("MGA plugin: weights mode without iterations; skipping.")
         return None
-    oracle_cfg = config["oracle"]
+    axes_cfg = config["axes"]
 
     logging.info(f"MGA plugin: mode = {mode!r}, epsilon = {config['epsilon']}")
     mga = MGA(
@@ -788,10 +863,9 @@ def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
             "scenario_name": scenario_name,
             "param_map": param_map,
         },
-        exclude_techs=config["exclude_techs"],
-        include_techs=config["include_techs"],
-        include_carrier_imports=config["include_carrier_imports"],
-        include_cost=bool(oracle_cfg.get("include_cost", False)),
+        technologies=axes_cfg.get("technologies"),
+        carrier_imports=axes_cfg.get("carrier_imports"),
+        include_cost=bool(axes_cfg.get("include_cost", False)),
     )
     mga.setup()
 
@@ -800,6 +874,6 @@ def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
         for i, iteration in enumerate(config["iterations"]):
             mga.run_iteration(iteration["weights"], i)
     else:
-        result = run_oracle_mode(mga, oracle_cfg)
+        result = run_oracle_mode(mga, config["oracle"])
     logging.info("MGA plugin: complete.")
     return result
