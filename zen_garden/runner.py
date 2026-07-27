@@ -11,13 +11,12 @@ import warnings
 from pathlib import Path
 
 import zen_garden.default_config as default_config
+from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.plugin_system.loader import register_plugins
 
 from .optimization_setup import OptimizationSetup
 from .postprocess.postprocess import Postprocess
 from .utils import InputDataChecks, ScenarioUtils, StringUtils, setup_logger
-
-from zen_garden.plugin_system.events import Event, EventPublisher
 
 # we setup the logger here
 setup_logger()
@@ -139,7 +138,7 @@ def run(config="./config.json", dataset=None, job_index=None, folder_output=None
             # overwrite time indices
             optimization_setup.overwrite_time_indices(step)
             # create optimization problem
-            optimization_setup.construct_optimization_problem() #in energy_system.py line 524 (also creates objective function)
+            optimization_setup.construct_optimization_problem()
             if optimization_setup.solver.use_scaling:
                 optimization_setup.scaling.run_scaling()
             elif (
@@ -148,7 +147,7 @@ def run(config="./config.json", dataset=None, job_index=None, folder_output=None
             ):
                 optimization_setup.scaling.analyze_numerics()
             # SOLVE THE OPTIMIZATION PROBLEM
-            optimization_setup.solve() # in optimization_setup.py line 676 (minimizes cost function)
+            optimization_setup.solve()
             # break if infeasible
             if not optimization_setup.optimality:
                 # write IIS
@@ -182,11 +181,9 @@ def run(config="./config.json", dataset=None, job_index=None, folder_output=None
                 param_map=param_map,
             )
 
-        # Fire after_solve once per scenario, only if its baseline solve
-        # was optimal. Placed after the step loop so each scenario gets
-        # its own MGA/ORACLE pass with that scenario's postprocess context.
-        # An infeasible scenario breaks the step loop early, leaving
-        # optimality False, so the guard skips it.
+        # Fire after_solve once per scenario, with that scenario's
+        # postprocess context. An infeasible scenario breaks the step loop
+        # early with optimality False, so the guard skips it.
         if optimization_setup.optimality:
             EventPublisher.trigger(
                 Event.after_solve,

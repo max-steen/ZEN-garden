@@ -39,6 +39,7 @@ class Event(Enum):
 
     after_solve = auto()
 
+
 class EventPublisher:
     """Class to register and trigger events.
 

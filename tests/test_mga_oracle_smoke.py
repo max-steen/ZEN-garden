@@ -23,13 +23,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-DATA_DIR = Path("/Users/maxsteen/zen-work/datasets/ZEN-models-Crystal_Ball/data")
+DATA_DIR = Path(os.environ.get(
+    "MGA_SMOKE_DATA", "/Users/maxsteen/zen-work/datasets/ZEN-models-Crystal_Ball/data"
+))
 DATASET = DATA_DIR / "Crystal_Ball_small"
 
 pytestmark = [
     pytest.mark.skipif(
         os.environ.get("RUN_MGA_SMOKE") != "1",
-        reason="set RUN_MGA_SMOKE=1 to run the MGA oracle smoke test (slow, needs Gurobi)",
+        reason="set RUN_MGA_SMOKE=1 to run (slow, needs Gurobi)",
     ),
     pytest.mark.skipif(not DATASET.is_dir(), reason=f"dataset missing: {DATASET}"),
 ]
@@ -53,11 +55,13 @@ def _out_dir(tmp_path: Path, tag: str) -> Path:
 
 
 def _run_smoke(config_path: Path, out_dir: Path):
-    """Run zen_garden on `config_path` in a subprocess; return (summary_dir, npz_path)."""
+    """Run zen_garden on `config_path`; return (summary_dir, npz_path)."""
     res = subprocess.run(
         [sys.executable, "-m", "zen_garden",
          f"--config={config_path}", f"--folder_output={out_dir}"],
-        cwd=out_dir,  # dataset paths resolve relative to the config file; cwd only corrals gurobi.log
+        # dataset paths resolve relative to the config file; the cwd only
+        # keeps gurobi.log out of the repo
+        cwd=out_dir,
         capture_output=True, text=True, timeout=3600,
     )
     assert res.returncode == 0, (
@@ -66,12 +70,12 @@ def _run_smoke(config_path: Path, out_dir: Path):
         f"--- stderr tail ---\n{res.stderr[-4000:]}"
     )
     summary = next(out_dir.glob("*_oracle_summary"))
-    npz_path = next(summary.glob("polytope*.npz"))  # run-id suffix varies with folder name
+    npz_path = next(summary.glob("polytope*.npz"))  # run-id suffix varies
     return summary, npz_path
 
 
 def _assert_polytope_properties(summary: Path, npz_path: Path, mga_cfg: dict):
-    """Common property assertions; returns (names, meta, cost_axis) for per-config checks."""
+    """Common property assertions; returns (names, meta, cost_axis)."""
     d = np.load(npz_path)  # schema has no object arrays; allow_pickle stays False
     assert set(d.files) == EXPECTED_KEYS, f"npz keys: {sorted(d.files)}"
 
@@ -134,8 +138,10 @@ def test_oracle_smoke_full(tmp_path):
     summary, npz_path = _run_smoke(cfg_path, _out_dir(tmp_path, "full"))
     names, meta, cost_axis = _assert_polytope_properties(summary, npz_path, mga_cfg)
 
-    assert names[:5] == ["nuclear", "photovoltaics", "battery", "hydro_lump", "biomass"]
-    assert [a["kind"] for a in meta["axes"]] == ["tech_capacity"] * 4 + ["carrier_import"]
+    assert names[:5] == ["nuclear", "photovoltaics", "battery", "hydro_lump",
+                         "biomass"]
+    assert [a["kind"] for a in meta["axes"]] == (["tech_capacity"] * 4
+                                                 + ["carrier_import"])
     assert meta["axes"][3]["members"] == ["reservoir_hydro", "run-of-river_hydro"]
     assert cost_axis == "net_present_cost"
 
