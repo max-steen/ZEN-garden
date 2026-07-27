@@ -58,11 +58,11 @@ def run_oracle_mode(mga, oracle_cfg):
 
     # The fmax LPs must run before the projection model is added: they provide
     # the normalisation denominators and the initial outer box. The optional
-    # fmin LPs complete VMM, so that all 2*n_z extreme designs seed the
-    # initial inner approximation.
+    # fmin LPs complete VMM: tight lower bounds for the outer box, and all
+    # 2*n_z extreme designs as initial inner points.
     mga.compute_fmax_normalization()
     if vmm_init:
-        mga.solve_extreme_lps("min")
+        mga.compute_fmin_bounds()
     initial_points = mga.initial_inner_points(include_extreme_designs=vmm_init)
     mga.setup_projection_model(initial_points=initial_points)
 
@@ -90,8 +90,7 @@ def run_oracle_mode(mga, oracle_cfg):
         if oracle_cfg.get("t_max_override") is not None:
             poly.t_max = float(oracle_cfg["t_max_override"])
 
-    # Gurobi options for the step-2 solves: solver defaults unless set in
-    # the config (production runs should set at least a TimeLimit).
+    # Gurobi options for the step-2 solves: solver defaults unless configured.
     milp_options = dict(oracle_cfg.get("milp_options", {}))
     if formulation == "dual_bilinear":
         # The bilinear objective needs Gurobi's global nonconvex-QP mode.

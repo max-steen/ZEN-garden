@@ -36,10 +36,11 @@ Config (the "plugins.mga" block in config.json):
     oracle (dict): tolerance (required), max_iterations (default 200),
         formulation ("kkt_milp" | "dual_bilinear"), include_cost (bool),
         vmm_initialization (bool, default False: complete the fmax LPs into
-        a full VMM pass -- additionally solve one fmin LP per axis and seed
-        the initial inner approximation with all 2*n_z extreme designs; the
-        initial outer box stays [0, 1]),
-        milp_options (Gurobi options for ORACLE's internal step-2 solves),
+        a full VMM pass -- additionally solve one fmin LP per axis, tighten
+        the initial outer box with the certified minima, and seed the
+        initial inner approximation with all 2*n_z extreme designs),
+        milp_options (Gurobi options for ORACLE's internal step-2 solves;
+        empty by default, so set at least a TimeLimit for production runs),
         Md_override, t_max_override, use_bigM,
         final_certificate_time_limit (seconds, 0 = off). See oracle_driver.py.
 
@@ -78,8 +79,10 @@ config = {
 # A cut returned by find_nearest_point must keep every known near-optimal
 # point inside the outer approximation; inexact projection duals (e.g.
 # barrier without crossover) can violate that. Violations above this trigger
-# (above coordinate-rounding noise, far below real failures) are repaired by
-# relaxing the cut offset out to the farthest known inner point.
+# are repaired by relaxing the cut offset out to the farthest known inner
+# point. Relaxing outward is always valid, so a rare false trigger from
+# coordinate rounding is harmless; real dual failures sit orders of
+# magnitude above the trigger.
 CUT_GUARD_TRIGGER = 1e-4
 
 # Dimension names of the projection-model variables. Postprocess cannot save
@@ -145,6 +148,9 @@ class MGA:
         self.u_star = None
         self._u_tilde = None
         self._offset = None
+        # Per-axis near-optimal minima from the fmin LPs (VMM only); None
+        # keeps the initial outer box's lower bounds at 0.
+        self.l_star = None
         # Raw exploration vectors of the extreme (fmax/fmin) designs,
         # collected by solve_extreme_lps for the VMM initialisation.
         self._extreme_designs_raw = []
@@ -381,8 +387,7 @@ class MGA:
     def polytope_metadata(self) -> dict:
         """Self-describing metadata for the saved polytope: per-axis kind,
         members, capacity type and physical unit, plus the normalisation
-        convention. The augmented scale/offset are not stored -- they are an
-        exact repackaging of (u_star, c_star, epsilon)."""
+        convention (schema owned by polytope_io)."""
         units = self.optimization_setup.variables.units
         ureg = self.optimization_setup.energy_system.unit_handling.ureg
         axes_meta = [
@@ -411,13 +416,11 @@ class MGA:
     # ------------------------------------------------------------------
 
     def compute_fmax_normalization(self) -> None:
-        """Solve one LP per axis maximising the axis value over the
-        near-optimal space.
+        """Set the normalisation from the fmax LPs (see solve_extreme_lps).
 
-        The maxima U_i* are both the normalisation denominators (z_i / U_i*)
-        and the initial outer box. They are always solved fresh -- the LPs
-        are cheap next to the full run, and caching would risk stale values.
-        Sets u_star and the augmented scale/offset; call after setup().
+        The per-axis maxima U_i* are the normalisation denominators
+        (z_i / U_i*) and the upper bounds of the initial outer box. Sets
+        u_star and the augmented scale/offset; call after setup().
         """
         self.u_star = self.solve_extreme_lps("max")
         bad = [name for name, u in zip(self.z_names, self.u_star, strict=True)
@@ -437,6 +440,17 @@ class MGA:
             offset.append(self.c_star)
         self._u_tilde = np.array(scale, dtype=float)
         self._offset = np.array(offset, dtype=float)
+
+    def compute_fmin_bounds(self) -> None:
+        """Set tight lower bounds of the initial outer box from the fmin LPs
+        (see solve_extreme_lps); the minimising designs double as initial
+        inner points.
+
+        Clamped at 0 against solver round-off (axis values are sums of
+        non-negative variables). A lower bound is only valid at a proven
+        minimum, which solve_extreme_lps enforces.
+        """
+        self.l_star = np.maximum(0.0, self.solve_extreme_lps("min"))
 
     def solve_extreme_lps(self, sense: str) -> np.ndarray:
         """Drive every axis to its near-optimal extreme: one LP per axis with
@@ -493,9 +507,9 @@ class MGA:
     def build_initial_outer_approximation(self) -> tuple[np.ndarray, np.ndarray]:
         """(A0, b0) of the initial outer polytope in normalised coordinates.
 
-        Raw rows per design axis: -z_i <= 0 (axis values are sums of
-        non-negative variables) and z_i <= U_i* (tight by construction), i.e.
-        the normalised design box is always [0, 1]; plus
+        Raw rows per design axis: -z_i <= -L_i and z_i <= U_i*, both tight
+        (L_i = 0 unless the fmin LPs ran; axis values are sums of
+        non-negative variables, so 0 is always a valid lower bound); plus
         C* <= C <= (1 + epsilon) * C* when include_cost. Each raw row
         a^T z_raw <= b is then mapped to normalised coordinates via
         z_raw = offset + diag(u_tilde) z_norm, i.e. it becomes
@@ -503,7 +517,8 @@ class MGA:
         """
         n_z = self.n_z
         A0 = np.vstack([-np.eye(n_z), np.eye(n_z)])
-        b0 = np.concatenate([np.zeros(n_z), self.u_star])
+        lower = self.l_star if self.l_star is not None else np.zeros(n_z)
+        b0 = np.concatenate([-lower, self.u_star])
         if self.include_cost:
             A0 = np.hstack([A0, np.zeros((A0.shape[0], 1))])
             cost_row = np.zeros((1, n_z + 1))
@@ -632,8 +647,9 @@ class MGA:
         the same coordinates: dist = t* is the normalised L-infinity
         distance, mu_cut is the dual of the projection equalities rescaled
         into normalised coordinates (mu_raw o u_tilde; the affine cost
-        offset cancels) and L2-normalised, and b_cut = mu_cut @ z_feas --
-        possibly relaxed by the cut-validity guard (CUT_GUARD_TRIGGER).
+        offset cancels), and b_cut = mu_cut @ z_feas -- possibly relaxed by
+        the cut-validity guard (CUT_GUARD_TRIGGER). The plane's scaling is
+        left to pyoNearOpt, which normalises every cut it accepts.
         """
         assert trial_point.shape == (self.n_explore,), (
             f"trial point shape {trial_point.shape}, expected ({self.n_explore},)"
@@ -687,7 +703,7 @@ class MGA:
         dist = float(self.t_var.solution.values[0])
 
         # Cut normal: duals of the projection equalities, rescaled into
-        # normalised coordinates, then L2-normalised together with b_cut.
+        # normalised coordinates.
         mu_design_raw = np.array(
             [
                 float(self.model.constraints[f"mga_oracle_proj_eq_axis{i}"].dual.values)
@@ -701,9 +717,6 @@ class MGA:
                 self.model.constraints["mga_oracle_proj_eq_cost"].dual.values[0]
             )
             mu_cut = np.append(mu_cut, mu_c_raw * self.epsilon * self.c_star)
-        scale = np.linalg.norm(mu_cut, ord=2)
-        if scale > 1e-4:
-            mu_cut = mu_cut / scale
         b_cut = float(mu_cut @ z_feas)
 
         # Cut-validity guard: a valid supporting hyperplane keeps every known
