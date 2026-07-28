@@ -46,18 +46,18 @@ def test_empty_config_yields_no_axes():
     assert build_axis_groups(None, None, TECHS, CARRIERS) == ([], [])
 
 
-@pytest.mark.parametrize("technologies, carriers, expected", [
-    (["typo"], None, KeyError),                       # unknown technology
-    (None, ["typo"], KeyError),                       # unknown carrier
-    (["nuclear", "nuclear"], None, ValueError),       # duplicate axis name
-    ([{"nuclear": ["pv"]}], None, ValueError),        # group shadows a tech
-    ([{"g": ["nuclear"]}, {"h": ["nuclear"]}], None, ValueError),  # member twice
-    ([{"g": ["nuclear"], "h": ["pv"]}], None, ValueError),  # two-key dict
-    ([{"g": []}], None, ValueError),                  # empty member list
-    ([42], None, ValueError),                         # not a name or dict
+@pytest.mark.parametrize("technologies, carriers", [
+    (["typo"], None),                       # unknown technology
+    (None, ["typo"]),                       # unknown carrier
+    (["nuclear", "nuclear"], None),         # duplicate axis name
+    ([{"nuclear": ["pv"]}], None),          # group shadows a tech
+    ([{"g": ["nuclear"]}, {"h": ["nuclear"]}], None),  # member twice
+    ([{"g": ["nuclear"], "h": ["pv"]}], None),         # two-key dict
+    ([{"g": []}], None),                    # empty member list
+    ([42], None),                           # not a name or dict
 ])
-def test_invalid_axis_configs_are_rejected(technologies, carriers, expected):
-    with pytest.raises(expected):
+def test_invalid_axis_configs_are_rejected(technologies, carriers):
+    with pytest.raises(ValueError):
         build_axis_groups(technologies, carriers, TECHS, CARRIERS)
 
 

@@ -103,7 +103,7 @@ def _parse_axis_list(entries, valid_members, reserved_names, label):
                 axis_of_member[member] = name
         groups.append((name, list(members)))
     if unknown:
-        raise KeyError(f"MGA {label}: unknown names {sorted(set(unknown))}")
+        raise ValueError(f"MGA {label}: unknown names {sorted(set(unknown))}")
     return groups
 
 

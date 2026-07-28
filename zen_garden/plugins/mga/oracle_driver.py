@@ -30,11 +30,11 @@ the certificate reads Gurobi's dual bound directly.
 
 pyoNearOpt compatibility: with the base (published) package only the default
 "kkt_milp" formulation exists ("dual_bilinear" needs the patched package and
-fails otherwise), and the base package must be run with
-oracle.step2.use_bigM = true -- under the SOS1 encoding it reports the step-2
-INCUMBENT as the metric, which is not a valid upper bound on the max-min
-distance, so the convergence claim, the in-loop t_max cap and the
-certificate's cap would all rest on an unsound value.
+fails otherwise). use_bigM defaults to true because the base package is only
+sound with the big-M encoding: under SOS1 it reports the step-2 INCUMBENT as
+the metric, which is not a valid upper bound on the max-min distance. Only
+set use_bigM = false (SOS1) with the patched package, which reads the true
+dual bound.
 """
 
 import importlib.metadata
@@ -74,11 +74,9 @@ def run_oracle_mode(mga, oracle_cfg):
             f"MGA oracle: unknown step-2 formulation {formulation!r}; "
             f"expected one of {list(FORMULATIONS)}."
         )
-    use_bigM = bool(step2.get("use_bigM", False))
-    if formulation == "dual_bilinear" and use_bigM:
-        logging.warning(
-            "MGA oracle: use_bigM is ignored with formulation='dual_bilinear'."
-        )
+    # Only meaningful for kkt_milp; true is the sound default there (see
+    # module docstring).
+    use_bigM = bool(step2.get("use_bigM", formulation == "kkt_milp"))
 
     # Step 1: bounds (and, with VMM, the extreme designs) must exist before
     # the projection model is added, because they define the coordinates.
@@ -130,9 +128,11 @@ def run_oracle_mode(mga, oracle_cfg):
         f"{'VMM' if supplied is None else 'supplied'}"
     )
 
-    # The summary folder is a sibling of the per-iteration Postprocess folders.
+    # The summary folder is a sibling of the per-iteration Postprocess
+    # folders; the subfolder separates scenarios (empty for plain runs).
     out = (Path(mga.optimization_setup.analysis.folder_output)
-           / f"{mga.postprocess_ctx['model_name']}_oracle_summary")
+           / f"{mga.postprocess_ctx['model_name']}_oracle_summary"
+           / mga.postprocess_ctx["subfolder"])
     out.mkdir(parents=True, exist_ok=True)
     df = None
     metric_source = "loop"

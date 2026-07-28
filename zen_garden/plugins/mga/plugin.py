@@ -14,7 +14,9 @@ under one of two modes:
   projection solves run on the ZEN-garden model (driver in oracle_driver.py).
 
 Rolling-horizon runs are rejected: after_solve fires after the horizon loop,
-so the plugin would only see the final step's model.
+so the plugin would only see the final step's model. Scaled runs
+(solver.use_scaling) and non-cost objectives are rejected too: MGA's added
+expressions assume an unscaled model and a total-cost C*.
 
 Glossary
     axis        one exploratory variable, i.e. one coordinate of the explored
@@ -50,9 +52,8 @@ Config (the "plugins.mga" block in config.json; unknown keys are rejected):
         big_M, t_max, solver_options, certificate_time_limit). See
         oracle_driver.py.
 
-pyoNearOpt compatibility: with the base (published) package only the default
-step-2 formulation "kkt_milp" exists, and it must be run with
-step2.use_bigM = true (see oracle_driver.py).
+pyoNearOpt compatibility (base vs patched package) is documented in
+oracle_driver.py.
 """
 
 import logging
@@ -161,7 +162,7 @@ class MGA:
 
     # Dims aggregated away per axis kind, besides the member dim itself.
     _TECH_AGG = ["set_capacity_types", "set_location", "set_years"]
-    _CARRIER_AGG = ["set_carriers", "set_nodes", "set_time_steps_operation"]
+    _CARRIER_AGG = ["set_nodes", "set_time_steps_operation"]
 
     def __init__(self, optimization_setup, epsilon, postprocess_ctx,
                  technologies=None, carrier_imports=None, include_cost=False):
@@ -247,7 +248,8 @@ class MGA:
             [self.axis_value(axis) for axis in self.axes], dtype=float
         )
 
-        self._iter_count = 0
+        # 1-based, matching pyoNearOpt's iteration numbers in diagnostics.csv.
+        self._iter_count = 1
 
     @property
     def design_axes(self) -> list[Axis]:
@@ -405,7 +407,7 @@ class MGA:
             )
         return (
             (self._ts_duration * flow.sel(set_carriers=members))
-            .sum(self._CARRIER_AGG)
+            .sum(self._CARRIER_AGG + ["set_carriers"])
         )
 
     def axis_expression(self, axis: Axis):
@@ -845,6 +847,17 @@ def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
             "MGA does not support rolling-horizon runs: after_solve fires "
             "after the horizon loop, so MGA would explore only the final "
             "step's model."
+        )
+    if optimization_setup.solver.use_scaling:
+        raise ValueError(
+            "MGA does not support solver.use_scaling: re-scaling restores "
+            "only the solution values, so MGA would add physical-unit "
+            "expressions to a still-scaled model."
+        )
+    if optimization_setup.analysis.objective != "total_cost":
+        raise ValueError(
+            f"MGA defines near-optimality on the total cost, but the "
+            f"baseline objective is {optimization_setup.analysis.objective!r}."
         )
     if mode == "weights" and not config["iterations"]:
         logging.warning("MGA: weights mode without iterations; skipping.")

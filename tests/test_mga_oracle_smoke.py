@@ -10,8 +10,8 @@ config state that shallow-merges and would leak keys across two in-process
 runner.run() calls.
 
 Gated: set RUN_MGA_SMOKE=1 to run (each config needs several minutes of
-Gurobi time). MGA_SMOKE_DATA overrides the dataset directory and
-MGA_SMOKE_OUT keeps the outputs instead of writing to pytest's tmp_path.
+Gurobi time) and MGA_SMOKE_DATA to the dataset directory. MGA_SMOKE_OUT
+keeps the outputs instead of writing to pytest's tmp_path.
 """
 
 import json
@@ -23,17 +23,20 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-DATA_DIR = Path(os.environ.get(
-    "MGA_SMOKE_DATA", "/Users/maxsteen/zen-work/datasets/ZEN-models-Crystal_Ball/data"
-))
-DATASET = DATA_DIR / "Crystal_Ball_small"
+_DATA = os.environ.get("MGA_SMOKE_DATA")
+DATA_DIR = Path(_DATA) if _DATA else None
+DATASET = DATA_DIR / "Crystal_Ball_small" if DATA_DIR else None
 
 pytestmark = [
     pytest.mark.skipif(
         os.environ.get("RUN_MGA_SMOKE") != "1",
         reason="set RUN_MGA_SMOKE=1 to run (slow, needs Gurobi)",
     ),
-    pytest.mark.skipif(not DATASET.is_dir(), reason=f"dataset missing: {DATASET}"),
+    pytest.mark.skipif(
+        DATASET is None or not DATASET.is_dir(),
+        reason="set MGA_SMOKE_DATA to the directory holding Crystal_Ball_small "
+        "and the config_smoke_*.json files",
+    ),
 ]
 
 # Hardcoded on purpose (not imported from polytope_io): the test must fail if
