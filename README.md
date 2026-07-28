@@ -91,11 +91,11 @@ baseline (`<model>` is the dataset name):
 
 ```text
 <model>/                    baseline (written by ZEN-garden itself)
-<model>_fmax_<axis>/        VMM maximum LP, one per design axis
-<model>_fmin_<axis>/        VMM minimum LP, one per design axis
-<model>_mga_iter_<i>/       weights mode: one folder per iteration
-<model>_oracle_iter_<n>/    oracle mode: one folder per projection solve
-                            (numbering matches diagnostics.csv)
+<model>_vmm_max_<axis>/    VMM maximum LP, one per design axis
+<model>_vmm_min_<axis>/    VMM minimum LP, one per design axis
+<model>_mga_iter_<i>/      weights mode: one folder per iteration
+<model>_oracle_iter_<n>/   oracle mode: one folder per projection solve
+                           (numbering matches diagnostics.csv)
 <model>_oracle_summary/     polytope.npz + diagnostics.csv
 ```
 
@@ -110,9 +110,6 @@ read back by `zen_garden/plugins/mga/polytope_io.py` (`load_polytope`).
   objectives are rejected; see the module docstring of `plugin.py`.
 - Config errors are reported only after the baseline solve (`after_solve`
   is the only plugin event available).
-
-*Further development of the plugin continues in the separate
-ZEN-garden-plugins repository; this fork is the frozen thesis state.*
 
 <hr style="height: 5px; background-color: black;">
 

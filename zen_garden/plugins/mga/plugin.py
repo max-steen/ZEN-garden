@@ -581,7 +581,7 @@ class MGA:
         proven optimum: an outer bound derived from an unconverged solve
         would not be valid ("unbounded" on a max means the axis has no finite
         near-optimal maximum). Every solution is written via Postprocess as
-        <model_name>_f<sense>_<axis> and recorded as an extreme design.
+        <model_name>_vmm_<sense>_<axis> and recorded as an extreme design.
         Returns the extreme values in design-axis order.
         """
         values = []
@@ -593,10 +593,10 @@ class MGA:
             self.optimization_setup.solve()
             if not self.optimization_setup.optimality:
                 raise RuntimeError(
-                    f"MGA f{sense} LP for axis {axis.name!r} ended with "
+                    f"MGA VMM {sense} LP for axis {axis.name!r} ended with "
                     f"{self.model.termination_condition!r}."
                 )
-            self._postprocess(f"f{sense}_{axis.name}")
+            self._postprocess(f"vmm_{sense}_{axis.name}")
             values.append(self.axis_value(axis))
             self._extreme_designs.append(
                 (
@@ -605,7 +605,7 @@ class MGA:
                 )
             )
             logging.info(
-                f"MGA: f{sense} {axis.name} = {values[-1]:.6g} "
+                f"MGA: VMM {sense} {axis.name} = {values[-1]:.6g} "
                 f"(LP took {time.time() - start:.1f} s)"
             )
         return np.array(values, dtype=float)
