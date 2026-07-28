@@ -9,9 +9,8 @@ Every exploratory variable is an axis -- a technology-capacity group, a
 carrier-import group, or the total cost -- so all per-axis arrays share one
 length and one order, matching the polytope's columns.
 
-Schema version 2:
+Schema:
 
-    schema_version  ()                   2
     A               (n_rows, n_axes)     outer approximation, normalised coords
     b               (n_rows,)
     X               (n_points, n_axes)   certified near-optimal points
@@ -38,9 +37,6 @@ Design axes use scale = upper bound and offset = 0, so the axis reaches 1 at
 its near-optimal maximum. The cost axis uses scale = epsilon * c_star and
 offset = c_star, so 0 is the cost optimum and 1 the near-optimality budget.
 Both conventions are stored explicitly because they do not follow one rule.
-
-Files written before schema version 2 are rejected with a clear error; a copy
-of the v1 reader is archived in the thesis repository (polytope_io_v1.py).
 """
 
 import json
@@ -49,22 +45,18 @@ from pathlib import Path
 
 import numpy as np
 
-SCHEMA_VERSION = 2
-
 # Axis kinds, stored per axis in `kinds` and in axis_meta_json.
 TECH_CAPACITY = "tech_capacity"
 CARRIER_IMPORT = "carrier_import"
 TOTAL_COST = "total_cost"
 
-# Keys every v2 file must carry.
-REQUIRED_KEYS = (
-    "schema_version", "A", "b", "X", "name_list", "kinds", "units", "scale",
+# Every key the schema defines; save_polytope writes all of them.
+NPZ_KEYS = (
+    "A", "b", "X", "name_list", "kinds", "units", "scale",
     "offset", "bounds_phys", "z_star_phys", "c_star", "epsilon", "tolerance",
-    "converged", "final_max_min_distance", "axis_meta_json",
+    "converged", "final_max_min_distance", "n_initial_rows", "point_origin",
+    "axis_meta_json", "run_json",
 )
-# Keys read with a default when absent, so the schema can grow without
-# invalidating existing files.
-OPTIONAL_KEYS = ("point_origin", "n_initial_rows", "run_json")
 
 
 @dataclass(frozen=True)
@@ -86,10 +78,10 @@ class Polytope:
     tolerance: float
     converged: bool
     final_max_min_distance: float
-    n_initial_rows: int = -1
-    point_origin: list[str] = field(default_factory=list)
-    meta: dict = field(default_factory=dict, repr=False)
-    run: dict = field(default_factory=dict, repr=False)
+    n_initial_rows: int
+    point_origin: list[str]
+    meta: dict = field(repr=False)
+    run: dict = field(repr=False)
 
     @property
     def n_axes(self) -> int:
@@ -113,7 +105,7 @@ class Polytope:
     @property
     def axes(self) -> list[dict]:
         """Per-axis metadata dicts (name, kind, members, capacity_type, unit)."""
-        return self.meta.get("axes", [])
+        return self.meta["axes"]
 
     def to_phys(self, Z) -> np.ndarray:
         """Map normalised coordinates (..., n_axes) to physical units."""
@@ -128,7 +120,6 @@ def save_polytope(path, poly: Polytope) -> None:
     """Write `poly` to `path` as an npz in the schema above."""
     np.savez(
         Path(path),
-        schema_version=SCHEMA_VERSION,
         A=poly.A, b=poly.b, X=poly.X,
         name_list=np.array(poly.names),
         kinds=np.array(poly.kinds),
@@ -152,24 +143,12 @@ def save_polytope(path, poly: Polytope) -> None:
 def load_polytope(path) -> Polytope:
     """Load a polytope npz written by save_polytope.
 
-    Raises KeyError for files that are not schema version 2 (including all
-    pre-versioning files) and ValueError for internally inconsistent shapes.
+    Raises KeyError for files that do not carry the full schema and
+    ValueError for internally inconsistent shapes.
     """
     path = Path(path)
     d = np.load(path)  # the schema has no object arrays; allow_pickle stays False
-    if "schema_version" not in d.files:
-        raise KeyError(
-            f"{path} predates polytope schema {SCHEMA_VERSION} (no "
-            f"schema_version). Read it with the archived v1 reader "
-            f"(polytope_io_v1.py) or re-run ORACLE with the current plugin."
-        )
-    version = int(d["schema_version"])
-    if version != SCHEMA_VERSION:
-        raise KeyError(
-            f"{path} has polytope schema version {version}, this reader "
-            f"expects {SCHEMA_VERSION}."
-        )
-    missing = [k for k in REQUIRED_KEYS if k not in d.files]
+    missing = [k for k in NPZ_KEYS if k not in d.files]
     if missing:
         raise KeyError(f"{path} is missing schema keys {missing}.")
 
@@ -200,20 +179,16 @@ def load_polytope(path) -> Polytope:
     if np.any(scale == 0.0):
         raise ValueError(f"{path}: scale contains zeros; cannot de-normalise.")
 
-    point_origin = (
-        [str(o) for o in d["point_origin"]] if "point_origin" in d.files
-        else ["unknown"] * X.shape[0]
-    )
     return Polytope(
         A=A, b=b, X=X, names=names, kinds=kinds, units=units,
         scale=scale, offset=offset, bounds_phys=bounds, z_star_phys=z_star,
         c_star=float(d["c_star"]), epsilon=float(d["epsilon"]),
         tolerance=float(d["tolerance"]), converged=bool(d["converged"]),
         final_max_min_distance=float(d["final_max_min_distance"]),
-        n_initial_rows=int(d["n_initial_rows"]) if "n_initial_rows" in d.files else -1,
-        point_origin=point_origin,
+        n_initial_rows=int(d["n_initial_rows"]),
+        point_origin=[str(o) for o in d["point_origin"]],
         meta=json.loads(str(d["axis_meta_json"])),
-        run=json.loads(str(d["run_json"])) if "run_json" in d.files else {},
+        run=json.loads(str(d["run_json"])),
     )
 
 
@@ -245,7 +220,3 @@ def phys_to_norm(Z, scale, offset) -> np.ndarray:
     return (Z - offset) / scale
 
 
-def axis_norm_to_phys(value, axis_name, names, scale, offset) -> float:
-    """Convert a single normalised value on the named axis to physical units."""
-    j = list(names).index(axis_name)  # ValueError for unknown names
-    return float(value * np.asarray(scale)[j] + np.asarray(offset)[j])

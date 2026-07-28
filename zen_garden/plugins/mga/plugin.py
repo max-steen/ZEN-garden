@@ -46,7 +46,9 @@ Config (the "plugins.mga" block in config.json; unknown keys are rejected):
         include_cost (bool): add the total-cost axis. Default False.
     oracle (dict): tolerance (required), max_iterations (default 200),
         initial_bounds ("vmm" (default) or a dict {axis: [lower, upper]}
-        covering every design axis), step2 (dict). See oracle_driver.py.
+        covering every design axis), step2 (dict: formulation, use_bigM,
+        big_M, t_max, solver_options, certificate_time_limit). See
+        oracle_driver.py.
 
 pyoNearOpt compatibility: with the base (published) package only the default
 step-2 formulation "kkt_milp" exists, and it must be run with
@@ -62,7 +64,7 @@ import xarray as xr
 from zen_garden.plugin_system.events import Event, EventPublisher
 from zen_garden.postprocess.postprocess import Postprocess
 
-from .axes import Axis, axis_physical_unit, build_axis_groups
+from .axes import COST_VARIABLE, Axis, axis_physical_unit, build_axis_groups
 from .oracle_driver import run_oracle_mode
 from .polytope_io import CARRIER_IMPORT, TECH_CAPACITY, TOTAL_COST
 
@@ -78,8 +80,8 @@ config = {
     "oracle": {},
 }
 
-# Recognised config keys per block; anything else is a typo or a stale key
-# from an older config and is rejected rather than silently ignored.
+# Recognised config keys per block; anything else is rejected rather than
+# silently ignored.
 _KNOWN_KEYS = {
     "plugins.mga": {"epsilon", "mode", "iterations", "axes", "oracle"},
     "plugins.mga.axes": {"technologies", "carrier_imports", "include_cost"},
@@ -88,11 +90,6 @@ _KNOWN_KEYS = {
     "plugins.mga.oracle.step2": {"formulation", "use_bigM", "big_M", "t_max",
                                  "solver_options", "certificate_time_limit"},
 }
-
-# The model variable behind the cost axis. objective_total_cost() is exactly
-# this variable summed over set_years, and it has no other dimension, so the
-# expression and the solution value below are the same quantity.
-COST_VARIABLE = "net_present_cost"
 
 # A cut returned by find_nearest_point must keep every known near-optimal
 # point inside the outer approximation; inexact projection duals (e.g.
@@ -104,7 +101,8 @@ COST_VARIABLE = "net_present_cost"
 CUT_GUARD_TRIGGER = 1e-4
 
 # Dimension names of the projection-model variables. Postprocess cannot save
-# dimensionless variables, so scalars get a trivial one-element dimension.
+# dimensionless variables, so the scalar t gets a trivial one-element
+# dimension.
 Z_DIM = "mga_z_axis"
 _SCALAR_DIM = "mga_oracle_scalar_dim"
 
@@ -127,16 +125,14 @@ def normalise_rows(A, b):
     A = np.asarray(A, dtype=float)
     b = np.asarray(b, dtype=float)
     norms = np.linalg.norm(A, axis=1)
-    norms = np.where(norms > 0.0, norms, 1.0)
     return A / norms[:, None], b / norms
 
 
 def validate_config(cfg) -> None:
     """Reject unknown keys in the plugin config.
 
-    Every setting is read with a default, so an unrecognised key (a typo, or
-    one renamed in an earlier version) would otherwise be ignored in silence
-    and the run would proceed on defaults.
+    Every setting is read with a default, so an unrecognised key would
+    otherwise be ignored in silence and the run would proceed on defaults.
     """
     for label, block in (
         ("plugins.mga", cfg),
@@ -276,7 +272,12 @@ class MGA:
         )
 
     def _total_cost_expression(self):
-        """The model's original total-cost objective as a linopy expression."""
+        """The model's original total-cost objective as a linopy expression.
+
+        This is exactly COST_VARIABLE summed over set_years, which has no
+        other dimension -- so the projection equality built from this
+        expression and the value read in axis_value are the same quantity.
+        """
         return self.optimization_setup.energy_system.rules.objective_total_cost(
             self.model
         )
@@ -297,7 +298,7 @@ class MGA:
             (weight_array * self._capacity_mask * self.capacity_addition).sum(),
             sense="min", overwrite=True,
         )
-        logging.info(f"MGA iter {iter_id}: weights = {weights}")
+        logging.info(f"MGA: iteration {iter_id} weights = {weights}")
         self._solve_and_postprocess(f"mga_iter_{iter_id}")
 
     def _build_weight_array(self, weights: dict) -> xr.DataArray:
@@ -351,8 +352,8 @@ class MGA:
             if bool(is_storage.sel(set_technologies=t))
         ]
         logging.info(
-            f"MGA capacity-type mask: storage tech(s) {storage_techs} use "
-            f"energy capacity, all other techs their power capacity."
+            f"MGA: storage tech(s) {storage_techs} use energy capacity, all "
+            f"other technologies their power capacity."
         )
         return keep.astype(float)
 
@@ -460,8 +461,7 @@ class MGA:
                     "kind": axis.kind,
                     "members": list(axis.members),
                     "capacity_type": axis.capacity_type,
-                    "unit": axis_physical_unit(axis, units, ureg,
-                                               cost_variable=COST_VARIABLE),
+                    "unit": axis_physical_unit(axis, units, ureg),
                 }
                 for axis in self.axes
             ],
@@ -494,12 +494,11 @@ class MGA:
         """
         if supplied_bounds is None:
             upper = self.solve_extreme_lps("max")
-            lower = self.solve_extreme_lps("min")
+            # Axis values are sums of non-negative variables, so a negative
+            # minimum can only be solver round-off.
+            lower = np.maximum(0.0, self.solve_extreme_lps("min"))
         else:
             lower, upper = self._read_supplied_bounds(supplied_bounds)
-        # Axis values are sums of non-negative variables, so a negative
-        # minimum can only be solver round-off.
-        lower = np.maximum(0.0, lower)
 
         bounds, scale, offset = [], [], []
         design_index = 0
@@ -533,7 +532,7 @@ class MGA:
         self.scale = np.array(scale, dtype=float)
         self.offset = np.array(offset, dtype=float)
         logging.info(
-            f"MGA bounds: {self.n_z} axes ready "
+            f"MGA: bounds of {self.n_z} axes ready "
             f"({'supplied' if supplied_bounds else 'VMM LPs'}); normalised "
             f"lower bounds "
             f"{np.round((self.bounds_phys[:, 0] - self.offset) / self.scale, 4)}"
@@ -596,7 +595,7 @@ class MGA:
                 np.array([self.axis_value(a) for a in self.axes], dtype=float),
             ))
             logging.info(
-                f"MGA f{sense}: {axis.name} = {values[-1]:.6g} "
+                f"MGA: f{sense} {axis.name} = {values[-1]:.6g} "
                 f"(LP took {time.time() - start:.1f} s)"
             )
         return np.array(values, dtype=float)
@@ -644,7 +643,7 @@ class MGA:
             )
         self.n_initial_rows = A0.shape[0]
         logging.info(
-            f"MGA outer approximation: {A0.shape[0]} unit-norm rows over "
+            f"MGA: outer approximation of {A0.shape[0]} unit-norm rows over "
             f"{n_z} normalised axes."
         )
         return A0, b0
@@ -848,11 +847,11 @@ def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
             "step's model."
         )
     if mode == "weights" and not config["iterations"]:
-        logging.warning("MGA plugin: weights mode without iterations; skipping.")
+        logging.warning("MGA: weights mode without iterations; skipping.")
         return None
     axes_cfg = config["axes"]
 
-    logging.info(f"MGA plugin: mode = {mode!r}, epsilon = {config['epsilon']}")
+    logging.info(f"MGA: mode = {mode!r}, epsilon = {config['epsilon']}")
     mga = MGA(
         optimization_setup,
         epsilon=config["epsilon"],
@@ -875,5 +874,5 @@ def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
             mga.run_iteration(iteration["weights"], i)
     else:
         result = run_oracle_mode(mga, config["oracle"])
-    logging.info("MGA plugin: complete.")
+    logging.info("MGA: complete.")
     return result

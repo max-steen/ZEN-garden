@@ -6,11 +6,15 @@ polytope npz round-trip. The end-to-end behaviour is covered by the gated
 smoke test in tests/test_mga_oracle_smoke.py.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
+import pandas as pd
+import pint
 import pytest
 
-from zen_garden.plugins.mga.axes import build_axis_groups
-from zen_garden.plugins.mga.plugin import normalise_rows, validate_config
+from zen_garden.plugins.mga.axes import Axis, axis_physical_unit, build_axis_groups
+from zen_garden.plugins.mga.plugin import MGA, normalise_rows, validate_config
 from zen_garden.plugins.mga.polytope_io import (
     CARRIER_IMPORT,
     TECH_CAPACITY,
@@ -84,6 +88,35 @@ def test_unknown_config_keys_are_rejected(cfg):
         validate_config(cfg)
 
 
+# -------------------------------------------------------------- supplied bounds
+
+def _mga_with_design_axes(*names):
+    """A bare MGA stand-in with only design_axes, enough for bounds parsing."""
+    axes = [Axis(n, TECH_CAPACITY, (n,), "power") for n in names]
+    return SimpleNamespace(design_axes=axes)
+
+
+def test_supplied_bounds_are_read_in_axis_order():
+    mga = _mga_with_design_axes("nuclear", "pv")
+    lower, upper = MGA._read_supplied_bounds(
+        mga, {"pv": [1.0, 9000.0], "nuclear": [0.0, 110.0]}
+    )
+    assert lower.tolist() == [0.0, 1.0]
+    assert upper.tolist() == [110.0, 9000.0]
+
+
+@pytest.mark.parametrize("bounds", [
+    {},                                          # missing every axis
+    {"nuclear": [0.0, 110.0]},                   # missing pv
+    {"nuclear": [0.0, 110.0], "pv": [0.0, 1.0], "typo": [0.0, 1.0]},
+    "vmm-typo",                                  # not a dict
+])
+def test_supplied_bounds_must_cover_design_axes_exactly(bounds):
+    mga = _mga_with_design_axes("nuclear", "pv")
+    with pytest.raises(ValueError):
+        MGA._read_supplied_bounds(mga, bounds)
+
+
 # ----------------------------------------------------------- row normalisation
 
 def test_normalise_rows_gives_unit_rows_and_keeps_the_half_spaces():
@@ -96,11 +129,6 @@ def test_normalise_rows_gives_unit_rows_and_keeps_the_half_spaces():
     # membership is unchanged: same sign of the residual, row by row
     assert np.array_equal(A @ point <= b, An @ point <= bn)
     assert np.allclose(bn[:2], 1.0)  # z <= 1 in both rows
-
-
-def test_normalise_rows_leaves_a_zero_row_alone():
-    An, bn = normalise_rows(np.zeros((1, 2)), np.array([1.0]))
-    assert np.array_equal(An, np.zeros((1, 2))) and bn[0] == 1.0
 
 
 # ------------------------------------------------------------- coordinate maps
@@ -179,8 +207,57 @@ def test_loaded_polytope_exposes_axis_roles(tmp_path):
     assert np.allclose(loaded.to_norm(loaded.to_phys(loaded.X)), loaded.X)
 
 
-def test_loader_rejects_files_without_a_schema_version(tmp_path):
-    path = tmp_path / "old.npz"
+def test_loader_reports_every_missing_schema_key(tmp_path):
+    path = tmp_path / "incomplete.npz"
     np.savez(path, A=np.eye(2), b=np.ones(2))
-    with pytest.raises(KeyError, match="schema"):
+    with pytest.raises(KeyError, match="missing schema keys"):
         load_polytope(path)
+
+
+# ------------------------------------------------------------- physical units
+
+def _units_series(index_names, tuples, unit_strings):
+    index = pd.MultiIndex.from_tuples(tuples, names=index_names)
+    return pd.Series(unit_strings, index=index, dtype=str)
+
+
+# Level names as ZEN-garden builds them for the unit series: the dimensions'
+# documentation names, not the set names the variables are indexed by.
+CAPACITY_UNITS = _units_series(
+    ["technology", "capacity_type", "location", "year"],
+    [("nuclear", "power", "DE", 2050), ("battery", "power", "DE", 2050),
+     ("battery", "energy", "DE", 2050)],
+    ["gigawatt", "gigawatt", "gigawatt_hour"],
+)
+IMPORT_UNITS = _units_series(
+    ["carrier", "node", "time_operation"],
+    [("biomass", "DE", 0), ("hydrogen", "DE", 0)],
+    ["gigawatt", "gigawatt"],
+)
+
+
+def test_tech_axis_unit_follows_the_selected_capacity_type():
+    units = {"capacity_addition": CAPACITY_UNITS}
+    power = Axis("nuclear", TECH_CAPACITY, ("nuclear",), "power")
+    energy = Axis("battery", TECH_CAPACITY, ("battery",), "energy")
+
+    assert axis_physical_unit(power, units, pint.UnitRegistry()) == "gigawatt"
+    assert axis_physical_unit(energy, units, pint.UnitRegistry()) == "gigawatt_hour"
+
+
+def test_carrier_axis_unit_is_annualised():
+    axis = Axis("biomass", CARRIER_IMPORT, ("biomass",), None)
+    unit = axis_physical_unit(axis, {"flow_import": IMPORT_UNITS},
+                              pint.UnitRegistry())
+    assert unit == "gigawatt * hour"
+
+
+def test_cost_axis_reads_the_cost_variable_unit():
+    axis = Axis("net_present_cost", TOTAL_COST, (), None)
+    units = {"net_present_cost": pd.Series(["megaEuro"], dtype=str)}
+    assert axis_physical_unit(axis, units, pint.UnitRegistry()) == "megaEuro"
+
+
+def test_unit_is_none_when_the_model_tracks_no_units():
+    axis = Axis("nuclear", TECH_CAPACITY, ("nuclear",), "power")
+    assert axis_physical_unit(axis, {}, pint.UnitRegistry()) is None

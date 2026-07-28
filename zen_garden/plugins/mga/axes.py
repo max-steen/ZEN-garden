@@ -13,7 +13,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .polytope_io import CARRIER_IMPORT, TECH_CAPACITY, TOTAL_COST
+from .polytope_io import TECH_CAPACITY, TOTAL_COST
+
+# The model variable behind the total-cost axis.
+COST_VARIABLE = "net_present_cost"
 
 
 @dataclass(frozen=True)
@@ -104,31 +107,22 @@ def _parse_axis_list(entries, valid_members, reserved_names, label):
     return groups
 
 
-# Substring needles for locating levels in the units-series MultiIndex; the
-# level names vary across ZEN-garden versions (e.g. "technology" vs
-# "set_technologies").
-_LEVEL_TECH = "technolog"
-_LEVEL_CAPACITY_TYPE = "capacity_type"
-_LEVEL_CARRIER = "carrier"
-
-
-def _find_level(index, needle):
-    """Name of the first index level containing `needle`, or None."""
-    return next((lvl for lvl in index.names if needle in lvl), None)
-
-
-def axis_physical_unit(axis, units, ureg, cost_variable="net_present_cost"):
+def axis_physical_unit(axis, units, ureg):
     """Physical unit string of one axis value, or None if unavailable.
 
     Tech axes read the capacity_addition unit at the selected capacity type;
     carrier axes annualise the instantaneous flow_import unit (x hour); the
-    cost axis reads the cost variable's unit. Heterogeneous lumps yield a
+    cost axis reads COST_VARIABLE's unit. Heterogeneous lumps yield a
     ' + '-joined string. `units` is the model's variable-unit mapping, which
     is empty when unit tracking is switched off.
+
+    The unit series are indexed by ZEN-garden's documentation names for the
+    dimensions ("technology", "capacity_type", "carrier"), which differ from
+    the set names the variables themselves are indexed by ("set_technologies"
+    and so on).
     """
-    members = list(axis.members)
     if axis.kind == TOTAL_COST:
-        series = units.get(cost_variable)
+        series = units.get(COST_VARIABLE)
         if series is None:
             return None
         found = sorted({str(u) for u in np.atleast_1d(np.asarray(series))})
@@ -138,25 +132,20 @@ def axis_physical_unit(axis, units, ureg, cost_variable="net_present_cost"):
         series = units.get("capacity_addition")
         if series is None:
             return None
-        tech_level = _find_level(series.index, _LEVEL_TECH)
-        type_level = _find_level(series.index, _LEVEL_CAPACITY_TYPE)
-        if tech_level is None or type_level is None:
-            return None
-        mask = (series.index.get_level_values(tech_level).isin(members)
-                & series.index.get_level_values(type_level)
-                .isin(axis.capacity_type.split("+")))
+        mask = (
+            series.index.get_level_values("technology").isin(axis.members)
+            & series.index.get_level_values("capacity_type")
+            .isin(axis.capacity_type.split("+"))
+        )
         found = sorted({str(u) for u in series[mask].to_numpy()})
         return " + ".join(found) if found else None
 
-    if axis.kind != CARRIER_IMPORT:
-        return None
+    # CARRIER_IMPORT: flow_import is an instantaneous rate, while the axis is
+    # the duration-weighted annual import, so the unit gains an hour.
     series = units.get("flow_import")
     if series is None:
         return None
-    carrier_level = _find_level(series.index, _LEVEL_CARRIER)
-    if carrier_level is None:
-        return None
-    mask = series.index.get_level_values(carrier_level).isin(members)
+    mask = series.index.get_level_values("carrier").isin(axis.members)
     annual = set()
     for unit in {str(u) for u in series[mask].to_numpy()}:
         try:

@@ -136,9 +136,11 @@ def run_oracle_mode(mga, oracle_cfg):
     out.mkdir(parents=True, exist_ok=True)
     df = None
     metric_source = "loop"
+    iterations_done = 0
     try:
         with _coordinate_warnings_suppressed():
             df = algo.refine_approximations()
+        iterations_done = 0 if df is None else int(len(df))
         df, metric_source = _run_final_certificate(
             df, poly, tolerance, step2, solver_options
         )
@@ -148,7 +150,7 @@ def run_oracle_mode(mga, oracle_cfg):
             "formulation": formulation,
             "use_bigM": use_bigM,
             "max_iterations": max_iterations,
-            "iterations_done": 0 if df is None else int(len(df)),
+            "iterations_done": iterations_done,
             "metric_source": metric_source,
             "initial_bounds": "vmm" if supplied is None else "supplied",
             "versions": _package_versions(),
@@ -222,12 +224,7 @@ def _save_artifacts(mga, poly, df, tolerance, out, point_origin, run_info):
     # initial set are those iterates.
     origins = list(point_origin)
     origins += ["iterate"] * (poly.X.shape[0] - len(origins))
-    # Name the file after the run (last "_"-token of the output folder, e.g.
-    # ".../my_model_06" -> polytope_06.npz) so collected files stay
-    # self-identifying.
-    run_id = Path(mga.optimization_setup.analysis.folder_output).name.split("_")[-1]
-    polytope_file = f"polytope_{run_id}.npz" if run_id else "polytope.npz"
-    save_polytope(out / polytope_file, Polytope(
+    save_polytope(out / "polytope.npz", Polytope(
         A=poly.A, b=poly.b, X=poly.X,
         names=list(mga.z_names),
         kinds=[axis.kind for axis in mga.axes],
@@ -255,7 +252,7 @@ def _save_artifacts(mga, poly, df, tolerance, out, point_origin, run_info):
     else:
         logging.warning("MGA oracle: no diagnostics to save (the refinement "
                         "loop raised); see traceback above.")
-    logging.info(f"MGA oracle: artifacts saved to {out} (polytope: {polytope_file})")
+    logging.info(f"MGA oracle: artifacts saved to {out}")
 
 
 def _package_versions() -> dict:

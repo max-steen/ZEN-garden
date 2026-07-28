@@ -39,7 +39,7 @@ pytestmark = [
 # Hardcoded on purpose (not imported from polytope_io): the test must fail if
 # the writer's schema drifts from this contract.
 EXPECTED_KEYS = {
-    "schema_version", "A", "b", "X", "name_list", "kinds", "units", "scale",
+    "A", "b", "X", "name_list", "kinds", "units", "scale",
     "offset", "bounds_phys", "z_star_phys", "c_star", "epsilon", "tolerance",
     "converged", "final_max_min_distance", "n_initial_rows", "point_origin",
     "axis_meta_json", "run_json",
@@ -71,15 +71,13 @@ def _run_smoke(config_path: Path, out_dir: Path):
         f"--- stderr tail ---\n{res.stderr[-4000:]}"
     )
     summary = next(out_dir.glob("*_oracle_summary"))
-    npz_path = next(summary.glob("polytope*.npz"))  # run-id suffix varies
-    return summary, npz_path
+    return summary, summary / "polytope.npz"
 
 
 def _assert_polytope_properties(summary: Path, npz_path: Path, mga_cfg: dict):
     """Common property assertions; returns (names, kinds, meta)."""
     d = np.load(npz_path)  # the schema has no object arrays; allow_pickle stays False
     assert set(d.files) == EXPECTED_KEYS, f"npz keys: {sorted(d.files)}"
-    assert int(d["schema_version"]) == 2
 
     A = d["A"]
     b = np.asarray(d["b"], dtype=float).ravel()
