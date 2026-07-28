@@ -86,10 +86,15 @@ config = {
 _KNOWN_KEYS = {
     "plugins.mga": {"epsilon", "mode", "iterations", "axes", "oracle"},
     "plugins.mga.axes": {"technologies", "carrier_imports", "include_cost"},
-    "plugins.mga.oracle": {"tolerance", "max_iterations", "initial_bounds",
-                           "step2"},
-    "plugins.mga.oracle.step2": {"formulation", "use_bigM", "big_M", "t_max",
-                                 "solver_options", "certificate_time_limit"},
+    "plugins.mga.oracle": {"tolerance", "max_iterations", "initial_bounds", "step2"},
+    "plugins.mga.oracle.step2": {
+        "formulation",
+        "use_bigM",
+        "big_M",
+        "t_max",
+        "solver_options",
+        "certificate_time_limit",
+    },
 }
 
 # A cut returned by find_nearest_point must keep every known near-optimal
@@ -110,8 +115,7 @@ _SCALAR_DIM = "mga_oracle_scalar_dim"
 
 def _scalar_da(value):
     """A one-element DataArray on the trivial scalar dimension."""
-    return xr.DataArray(np.array([value]), dims=_SCALAR_DIM,
-                        coords={_SCALAR_DIM: [0]})
+    return xr.DataArray(np.array([value]), dims=_SCALAR_DIM, coords={_SCALAR_DIM: [0]})
 
 
 def normalise_rows(A, b):
@@ -164,8 +168,15 @@ class MGA:
     _TECH_AGG = ["set_capacity_types", "set_location", "set_years"]
     _CARRIER_AGG = ["set_nodes", "set_time_steps_operation"]
 
-    def __init__(self, optimization_setup, epsilon, postprocess_ctx,
-                 technologies=None, carrier_imports=None, include_cost=False):
+    def __init__(
+        self,
+        optimization_setup,
+        epsilon,
+        postprocess_ctx,
+        technologies=None,
+        carrier_imports=None,
+        include_cost=False,
+    ):
         """
         Args:
             optimization_setup: OptimizationSetup holding the solved baseline
@@ -208,8 +219,12 @@ class MGA:
         # (coordinates, cut normals, polytope columns): technology axes, then
         # carrier axes, then the cost axis.
         self.axes: list[Axis] = [
-            Axis(name, TECH_CAPACITY, tuple(members),
-                 self._selected_capacity_type(name, members))
+            Axis(
+                name,
+                TECH_CAPACITY,
+                tuple(members),
+                self._selected_capacity_type(name, members),
+            )
             for name, members in tech_groups
         ] + [
             Axis(name, CARRIER_IMPORT, tuple(members), None)
@@ -298,7 +313,8 @@ class MGA:
         weight_array = self._build_weight_array(weights)
         self.model.add_objective(
             (weight_array * self._capacity_mask * self.capacity_addition).sum(),
-            sense="min", overwrite=True,
+            sense="min",
+            overwrite=True,
         )
         logging.info(f"MGA: iteration {iter_id} weights = {weights}")
         self._solve_and_postprocess(f"mga_iter_{iter_id}")
@@ -335,12 +351,14 @@ class MGA:
         system.set_capacity_types[0] by ZEN-garden convention.
         """
         type_dim = "set_capacity_types"
-        other_dims = [d for d in self.capacity_addition.dims
-                      if d not in ("set_technologies", type_dim)]
+        other_dims = [
+            d
+            for d in self.capacity_addition.dims
+            if d not in ("set_technologies", type_dim)
+        ]
         active = (self.capacity_addition.labels != -1).any(other_dims)
         power_type = str(self.optimization_setup.system.set_capacity_types[0])
-        known_types = [str(c) for c in
-                       self.capacity_addition.coords[type_dim].values]
+        known_types = [str(c) for c in self.capacity_addition.coords[type_dim].values]
         if power_type not in known_types:
             raise RuntimeError(
                 f"MGA: power capacity type {power_type!r} not found in "
@@ -350,7 +368,8 @@ class MGA:
         is_power = active[type_dim] == power_type
         keep = active & ~(is_storage & is_power)
         storage_techs = [
-            str(t) for t in active["set_technologies"].values
+            str(t)
+            for t in active["set_technologies"].values
             if bool(is_storage.sel(set_technologies=t))
         ]
         logging.info(
@@ -370,8 +389,12 @@ class MGA:
             member: tuple(
                 str(c)
                 for c in self._capacity_mask.coords["set_capacity_types"].values
-                if float(self._capacity_mask.sel(set_technologies=member,
-                                                 set_capacity_types=c)) > 0.5
+                if float(
+                    self._capacity_mask.sel(
+                        set_technologies=member, set_capacity_types=c
+                    )
+                )
+                > 0.5
             )
             for member in members
         }
@@ -405,27 +428,24 @@ class MGA:
                 .sel(set_technologies=members)
                 .sum(self._TECH_AGG + ["set_technologies"])
             )
-        return (
-            (self._ts_duration * flow.sel(set_carriers=members))
-            .sum(self._CARRIER_AGG + ["set_carriers"])
+        return (self._ts_duration * flow.sel(set_carriers=members)).sum(
+            self._CARRIER_AGG + ["set_carriers"]
         )
 
     def axis_expression(self, axis: Axis):
         """Linopy expression of one axis (bound LP objective, projection)."""
         if axis.kind == TOTAL_COST:
             return self._total_cost_expression()
-        return self._design_axis_terms(
-            axis, self.capacity_addition, self.flow_import
-        )
+        return self._design_axis_terms(axis, self.capacity_addition, self.flow_import)
 
     def axis_value(self, axis: Axis) -> float:
         """Value of one axis on the currently loaded solution."""
         if axis.kind == TOTAL_COST:
             return float(self.model.variables[COST_VARIABLE].solution.sum())
         flow = None if self.flow_import is None else self.flow_import.solution
-        return float(self._design_axis_terms(
-            axis, self.capacity_addition.solution, flow
-        ))
+        return float(
+            self._design_axis_terms(axis, self.capacity_addition.solution, flow)
+        )
 
     # ------------------------------------------------------------------
     # oracle mode: coordinates
@@ -592,10 +612,12 @@ class MGA:
                 )
             self._postprocess(f"f{sense}_{axis.name}")
             values.append(self.axis_value(axis))
-            self._extreme_designs.append((
-                f"{sense}:{axis.name}",
-                np.array([self.axis_value(a) for a in self.axes], dtype=float),
-            ))
+            self._extreme_designs.append(
+                (
+                    f"{sense}:{axis.name}",
+                    np.array([self.axis_value(a) for a in self.axes], dtype=float),
+                )
+            )
             logging.info(
                 f"MGA: f{sense} {axis.name} = {values[-1]:.6g} "
                 f"(LP took {time.time() - start:.1f} s)"
@@ -691,17 +713,20 @@ class MGA:
             np.array(self.z_names), dims=Z_DIM, coords={Z_DIM: self.z_names}
         )
         self.delta = self.model.add_variables(
-            coords=[z_coord], name="mga_oracle_delta",
-            lower=-np.inf, upper=np.inf,
+            coords=[z_coord],
+            name="mga_oracle_delta",
+            lower=-np.inf,
+            upper=np.inf,
         )
         self.t_var = self.model.add_variables(
-            coords=[_scalar_da(0)], name="mga_oracle_t", lower=0.0,
+            coords=[_scalar_da(0)],
+            name="mga_oracle_t",
+            lower=0.0,
         )
 
         for i, axis in enumerate(self.axes):
             self.model.add_constraints(
-                self.axis_expression(axis)
-                - self.delta.sel({Z_DIM: axis.name}) == 0.0,
+                self.axis_expression(axis) - self.delta.sel({Z_DIM: axis.name}) == 0.0,
                 name=f"mga_oracle_proj_eq_axis{i}",
             )
 
@@ -737,9 +762,9 @@ class MGA:
         (CUT_GUARD_TRIGGER). The plane's scaling is left to pyoNearOpt, which
         normalises every cut it accepts.
         """
-        assert trial_point.shape == (self.n_z,), (
-            f"trial point shape {trial_point.shape}, expected ({self.n_z},)"
-        )
+        assert trial_point.shape == (
+            self.n_z,
+        ), f"trial point shape {trial_point.shape}, expected ({self.n_z},)"
 
         # Projection-equality RHS <- the trial point in physical coordinates.
         trial_phys = self.to_phys(trial_point)
@@ -831,9 +856,11 @@ class MGA:
 # Event handler and mode dispatch
 # ----------------------------------------------------------------------
 
+
 @EventPublisher.register(Event.after_solve)
-def run_mga(*, optimization_setup, scenarios, subfolder, model_name,
-            scenario_name, param_map):
+def run_mga(
+    *, optimization_setup, scenarios, subfolder, model_name, scenario_name, param_map
+):
     """Run MGA after the baseline solve.
 
     Returns the oracle summary directory (oracle mode) or None.

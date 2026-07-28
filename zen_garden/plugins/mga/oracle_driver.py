@@ -88,7 +88,9 @@ def run_oracle_mode(mga, oracle_cfg):
     with _coordinate_warnings_suppressed():
         A0, b0 = mga.build_initial_outer_approximation()
         approximation_kwargs = dict(
-            A=A0, X=initial_points, b=b0,
+            A=A0,
+            X=initial_points,
+            b=b0,
             name_list=list(mga.z_names),
             use_bigM=use_bigM,
         )
@@ -130,9 +132,11 @@ def run_oracle_mode(mga, oracle_cfg):
 
     # The summary folder is a sibling of the per-iteration Postprocess
     # folders; the subfolder separates scenarios (empty for plain runs).
-    out = (Path(mga.optimization_setup.analysis.folder_output)
-           / f"{mga.postprocess_ctx['model_name']}_oracle_summary"
-           / mga.postprocess_ctx["subfolder"])
+    out = (
+        Path(mga.optimization_setup.analysis.folder_output)
+        / f"{mga.postprocess_ctx['model_name']}_oracle_summary"
+        / mga.postprocess_ctx["subfolder"]
+    )
     out.mkdir(parents=True, exist_ok=True)
     df = None
     metric_source = "loop"
@@ -179,8 +183,10 @@ def _run_final_certificate(df, poly, tolerance, step2, solver_options):
     if last <= tolerance:
         return df, "loop"
 
-    logging.info(f"MGA oracle: final certificate solve "
-                 f"(TimeLimit = {time_limit:.0f}s, cap = {last:.4g}).")
+    logging.info(
+        f"MGA oracle: final certificate solve "
+        f"(TimeLimit = {time_limit:.0f}s, cap = {last:.4g})."
+    )
     try:
         poly.t_max = last
         poly.inner_outer_model()
@@ -195,8 +201,10 @@ def _run_final_certificate(df, poly, tolerance, step2, solver_options):
         )
         return df, "loop"
 
-    logging.info(f"MGA oracle: final certificate {last:.4g} -> {certified:.4g} "
-                 f"(tol = {tolerance:.4g}).")
+    logging.info(
+        f"MGA oracle: final certificate {last:.4g} -> {certified:.4g} "
+        f"(tol = {tolerance:.4g})."
+    )
     row = {c: None for c in df.columns}
     row["max_min_distance"] = certified
     if "iteration" in df.columns:
@@ -224,34 +232,43 @@ def _save_artifacts(mga, poly, df, tolerance, out, point_origin, run_info):
     # initial set are those iterates.
     origins = list(point_origin)
     origins += ["iterate"] * (poly.X.shape[0] - len(origins))
-    save_polytope(out / "polytope.npz", Polytope(
-        A=poly.A, b=poly.b, X=poly.X,
-        names=list(mga.z_names),
-        kinds=[axis.kind for axis in mga.axes],
-        units=[axis_meta["unit"] or "" for axis_meta in meta["axes"]],
-        scale=mga.scale,
-        offset=mga.offset,
-        bounds_phys=mga.bounds_phys,
-        z_star_phys=mga.z_star_phys,
-        c_star=float(mga.c_star),
-        epsilon=float(mga.epsilon),
-        tolerance=float(tolerance),
-        converged=converged,
-        final_max_min_distance=float(final_distance),
-        n_initial_rows=int(mga.n_initial_rows),
-        point_origin=origins,
-        meta=meta,
-        run=run_info,
-    ))
+    save_polytope(
+        out / "polytope.npz",
+        Polytope(
+            A=poly.A,
+            b=poly.b,
+            X=poly.X,
+            names=list(mga.z_names),
+            kinds=[axis.kind for axis in mga.axes],
+            units=[axis_meta["unit"] or "" for axis_meta in meta["axes"]],
+            scale=mga.scale,
+            offset=mga.offset,
+            bounds_phys=mga.bounds_phys,
+            z_star_phys=mga.z_star_phys,
+            c_star=float(mga.c_star),
+            epsilon=float(mga.epsilon),
+            tolerance=float(tolerance),
+            converged=converged,
+            final_max_min_distance=float(final_distance),
+            n_initial_rows=int(mga.n_initial_rows),
+            point_origin=origins,
+            meta=meta,
+            run=run_info,
+        ),
+    )
     if df is not None:
         df.to_csv(out / "diagnostics.csv", index=False)
         log = logging.info if converged else logging.warning
-        log(f"MGA oracle: {'CONVERGED' if converged else 'did NOT converge'} "
+        log(
+            f"MGA oracle: {'CONVERGED' if converged else 'did NOT converge'} "
             f"after {len(df)} iterations, final max_min_distance = "
-            f"{final_distance:.4g} (tol = {tolerance:.4g}).")
+            f"{final_distance:.4g} (tol = {tolerance:.4g})."
+        )
     else:
-        logging.warning("MGA oracle: no diagnostics to save (the refinement "
-                        "loop raised); see traceback above.")
+        logging.warning(
+            "MGA oracle: no diagnostics to save (the refinement "
+            "loop raised); see traceback above."
+        )
     logging.info(f"MGA oracle: artifacts saved to {out}")
 
 

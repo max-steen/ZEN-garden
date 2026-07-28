@@ -32,13 +32,15 @@ CARRIERS = ["biomass", "hydrogen"]
 
 # ---------------------------------------------------------------- axis config
 
+
 def test_singleton_and_lumped_axes_keep_user_order():
     tech_groups, carrier_groups = build_axis_groups(
-        ["nuclear", {"hydro": ["hydro_a", "hydro_b"]}], ["biomass"],
-        TECHS, CARRIERS,
+        ["nuclear", {"hydro": ["hydro_a", "hydro_b"]}],
+        ["biomass"],
+        TECHS,
+        CARRIERS,
     )
-    assert tech_groups == [("nuclear", ["nuclear"]),
-                           ("hydro", ["hydro_a", "hydro_b"])]
+    assert tech_groups == [("nuclear", ["nuclear"]), ("hydro", ["hydro_a", "hydro_b"])]
     assert carrier_groups == [("biomass", ["biomass"])]
 
 
@@ -46,16 +48,19 @@ def test_empty_config_yields_no_axes():
     assert build_axis_groups(None, None, TECHS, CARRIERS) == ([], [])
 
 
-@pytest.mark.parametrize("technologies, carriers", [
-    (["typo"], None),                       # unknown technology
-    (None, ["typo"]),                       # unknown carrier
-    (["nuclear", "nuclear"], None),         # duplicate axis name
-    ([{"nuclear": ["pv"]}], None),          # group shadows a tech
-    ([{"g": ["nuclear"]}, {"h": ["nuclear"]}], None),  # member twice
-    ([{"g": ["nuclear"], "h": ["pv"]}], None),         # two-key dict
-    ([{"g": []}], None),                    # empty member list
-    ([42], None),                           # not a name or dict
-])
+@pytest.mark.parametrize(
+    "technologies, carriers",
+    [
+        (["typo"], None),  # unknown technology
+        (None, ["typo"]),  # unknown carrier
+        (["nuclear", "nuclear"], None),  # duplicate axis name
+        ([{"nuclear": ["pv"]}], None),  # group shadows a tech
+        ([{"g": ["nuclear"]}, {"h": ["nuclear"]}], None),  # member twice
+        ([{"g": ["nuclear"], "h": ["pv"]}], None),  # two-key dict
+        ([{"g": []}], None),  # empty member list
+        ([42], None),  # not a name or dict
+    ],
+)
 def test_invalid_axis_configs_are_rejected(technologies, carriers):
     with pytest.raises(ValueError):
         build_axis_groups(technologies, carriers, TECHS, CARRIERS)
@@ -63,32 +68,41 @@ def test_invalid_axis_configs_are_rejected(technologies, carriers):
 
 def test_axis_name_cannot_be_used_twice_across_blocks():
     with pytest.raises(ValueError):
-        build_axis_groups([{"shared": ["nuclear"]}], [{"shared": ["biomass"]}],
-                          TECHS, CARRIERS)
+        build_axis_groups(
+            [{"shared": ["nuclear"]}], [{"shared": ["biomass"]}], TECHS, CARRIERS
+        )
 
 
 # ------------------------------------------------------------ config validation
 
+
 def test_valid_config_passes():
-    validate_config({
-        "epsilon": 0.1, "mode": "oracle",
-        "axes": {"technologies": ["nuclear"], "include_cost": True},
-        "oracle": {"tolerance": 0.1, "step2": {"use_bigM": True}},
-    })
+    validate_config(
+        {
+            "epsilon": 0.1,
+            "mode": "oracle",
+            "axes": {"technologies": ["nuclear"], "include_cost": True},
+            "oracle": {"tolerance": 0.1, "step2": {"use_bigM": True}},
+        }
+    )
 
 
-@pytest.mark.parametrize("cfg", [
-    {"epsilonn": 0.1},                                  # top-level typo
-    {"axes": {"technolgies": []}},                      # axes typo
-    {"oracle": {"tolerance": 0.1, "max_iter": 10}},     # oracle typo
-    {"oracle": {"step2": {"milp_options": {}}}},        # renamed key
-])
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"epsilonn": 0.1},  # top-level typo
+        {"axes": {"technolgies": []}},  # axes typo
+        {"oracle": {"tolerance": 0.1, "max_iter": 10}},  # oracle typo
+        {"oracle": {"step2": {"milp_options": {}}}},  # renamed key
+    ],
+)
 def test_unknown_config_keys_are_rejected(cfg):
     with pytest.raises(ValueError, match="Unknown MGA config key"):
         validate_config(cfg)
 
 
 # -------------------------------------------------------------- supplied bounds
+
 
 def _mga_with_design_axes(*names):
     """A bare MGA stand-in with only design_axes, enough for bounds parsing."""
@@ -105,12 +119,15 @@ def test_supplied_bounds_are_read_in_axis_order():
     assert upper.tolist() == [110.0, 9000.0]
 
 
-@pytest.mark.parametrize("bounds", [
-    {},                                          # missing every axis
-    {"nuclear": [0.0, 110.0]},                   # missing pv
-    {"nuclear": [0.0, 110.0], "pv": [0.0, 1.0], "typo": [0.0, 1.0]},
-    "vmm-typo",                                  # not a dict
-])
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        {},  # missing every axis
+        {"nuclear": [0.0, 110.0]},  # missing pv
+        {"nuclear": [0.0, 110.0], "pv": [0.0, 1.0], "typo": [0.0, 1.0]},
+        "vmm-typo",  # not a dict
+    ],
+)
 def test_supplied_bounds_must_cover_design_axes_exactly(bounds):
     mga = _mga_with_design_axes("nuclear", "pv")
     with pytest.raises(ValueError):
@@ -118,6 +135,7 @@ def test_supplied_bounds_must_cover_design_axes_exactly(bounds):
 
 
 # ----------------------------------------------------------- row normalisation
+
 
 def test_normalise_rows_gives_unit_rows_and_keeps_the_half_spaces():
     A = np.array([[3.0, 0.0], [0.0, 743303.0], [-3.0, 4.0]])
@@ -133,12 +151,14 @@ def test_normalise_rows_gives_unit_rows_and_keeps_the_half_spaces():
 
 # ------------------------------------------------------------- coordinate maps
 
+
 def test_norm_phys_round_trip():
     scale = np.array([110.0, 9834.0, 3.0e8])
     offset = np.array([0.0, 0.0, 1.25e9])
     norm = np.array([[0.0, 0.5, 1.0], [1.0, 0.25, 0.0]])
-    assert np.allclose(phys_to_norm(norm_to_phys(norm, scale, offset),
-                                    scale, offset), norm)
+    assert np.allclose(
+        phys_to_norm(norm_to_phys(norm, scale, offset), scale, offset), norm
+    )
 
 
 def test_cost_axis_maps_optimum_to_zero_and_budget_to_one():
@@ -155,10 +175,12 @@ def test_coordinate_map_rejects_wrong_axis_count():
 
 # ------------------------------------------------------------------ npz schema
 
+
 def _polytope() -> Polytope:
     return Polytope(
-        A=np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
-                    [0.0, 0.0, 1.0]]),
+        A=np.array(
+            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        ),
         b=np.array([0.0, 1.0, 1.0, 1.0]),
         X=np.array([[0.1, 0.2, 0.0], [1.0, 0.5, 0.4]]),
         names=["nuclear", "biomass", "net_present_cost"],
@@ -168,8 +190,12 @@ def _polytope() -> Polytope:
         offset=np.array([0.0, 0.0, 1.25e9]),
         bounds_phys=np.array([[0.0, 110.0], [0.0, 777923.0], [1.25e9, 1.3750e9]]),
         z_star_phys=np.array([11.0, 155584.6, 1.25e9]),
-        c_star=1.25e9, epsilon=0.1, tolerance=0.1, converged=False,
-        final_max_min_distance=0.26, n_initial_rows=4,
+        c_star=1.25e9,
+        epsilon=0.1,
+        tolerance=0.1,
+        converged=False,
+        final_max_min_distance=0.26,
+        n_initial_rows=4,
         point_origin=["z_star", "max:nuclear"],
         meta={"axes": [{"name": "nuclear"}], "normalisation": "affine"},
         run={"formulation": "dual_bilinear", "iterations_done": 7},
@@ -216,6 +242,7 @@ def test_loader_reports_every_missing_schema_key(tmp_path):
 
 # ------------------------------------------------------------- physical units
 
+
 def _units_series(index_names, tuples, unit_strings):
     index = pd.MultiIndex.from_tuples(tuples, names=index_names)
     return pd.Series(unit_strings, index=index, dtype=str)
@@ -225,8 +252,11 @@ def _units_series(index_names, tuples, unit_strings):
 # documentation names, not the set names the variables are indexed by.
 CAPACITY_UNITS = _units_series(
     ["technology", "capacity_type", "location", "year"],
-    [("nuclear", "power", "DE", 2050), ("battery", "power", "DE", 2050),
-     ("battery", "energy", "DE", 2050)],
+    [
+        ("nuclear", "power", "DE", 2050),
+        ("battery", "power", "DE", 2050),
+        ("battery", "energy", "DE", 2050),
+    ],
     ["gigawatt", "gigawatt", "gigawatt_hour"],
 )
 IMPORT_UNITS = _units_series(
@@ -247,8 +277,7 @@ def test_tech_axis_unit_follows_the_selected_capacity_type():
 
 def test_carrier_axis_unit_is_annualised():
     axis = Axis("biomass", CARRIER_IMPORT, ("biomass",), None)
-    unit = axis_physical_unit(axis, {"flow_import": IMPORT_UNITS},
-                              pint.UnitRegistry())
+    unit = axis_physical_unit(axis, {"flow_import": IMPORT_UNITS}, pint.UnitRegistry())
     assert unit == "gigawatt * hour"
 
 

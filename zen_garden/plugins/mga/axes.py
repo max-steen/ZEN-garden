@@ -37,8 +37,7 @@ class Axis:
     capacity_type: str | None
 
 
-def build_axis_groups(technologies, carrier_imports, all_technologies,
-                      all_carriers):
+def build_axis_groups(technologies, carrier_imports, all_technologies, all_carriers):
     """Turn the axis config lists into ordered (name, members) groups.
 
     Returns (tech_groups, carrier_groups), each in the user's order.
@@ -50,7 +49,9 @@ def build_axis_groups(technologies, carrier_imports, all_technologies,
     # Axis names share one namespace with the model names in the polytope
     # file, so carrier groups must not reuse a technology or carrier name.
     carrier_groups = _parse_axis_list(
-        carrier_imports, carrier_set, tech_set | carrier_set,
+        carrier_imports,
+        carrier_set,
+        tech_set | carrier_set,
         "axes.carrier_imports",
     )
     duplicates = {n for n, _ in tech_groups} & {n for n, _ in carrier_groups}
@@ -80,14 +81,22 @@ def _parse_axis_list(entries, valid_members, reserved_names, label):
         elif isinstance(entry, dict) and len(entry) == 1:
             name, members = next(iter(entry.items()))
             if name in reserved_names:
-                raise ValueError(f"MGA {label}: group name {name!r} shadows an "
-                                 f"existing technology or carrier name.")
+                raise ValueError(
+                    f"MGA {label}: group name {name!r} shadows an "
+                    f"existing technology or carrier name."
+                )
         else:
-            raise ValueError(f"MGA {label}: invalid entry {entry!r}, expected "
-                             f"a name or a single {{group: [members]}} dict.")
-        well_formed = (isinstance(name, str) and name
-                       and isinstance(members, list) and members
-                       and all(isinstance(m, str) and m for m in members))
+            raise ValueError(
+                f"MGA {label}: invalid entry {entry!r}, expected "
+                f"a name or a single {{group: [members]}} dict."
+            )
+        well_formed = (
+            isinstance(name, str)
+            and name
+            and isinstance(members, list)
+            and members
+            and all(isinstance(m, str) and m for m in members)
+        )
         if not well_formed:
             raise ValueError(f"MGA {label}: invalid entry {entry!r}.")
         if name in seen_names:
@@ -97,8 +106,10 @@ def _parse_axis_list(entries, valid_members, reserved_names, label):
             if member not in valid_members:
                 unknown.append(member)
             elif member in axis_of_member:
-                raise ValueError(f"MGA {label}: {member!r} appears in both axis "
-                                 f"{axis_of_member[member]!r} and {name!r}.")
+                raise ValueError(
+                    f"MGA {label}: {member!r} appears in both axis "
+                    f"{axis_of_member[member]!r} and {name!r}."
+                )
             else:
                 axis_of_member[member] = name
         groups.append((name, list(members)))
@@ -132,10 +143,10 @@ def axis_physical_unit(axis, units, ureg):
         series = units.get("capacity_addition")
         if series is None:
             return None
-        mask = (
-            series.index.get_level_values("technology").isin(axis.members)
-            & series.index.get_level_values("capacity_type")
-            .isin(axis.capacity_type.split("+"))
+        mask = series.index.get_level_values("technology").isin(
+            axis.members
+        ) & series.index.get_level_values("capacity_type").isin(
+            axis.capacity_type.split("+")
         )
         found = sorted({str(u) for u in series[mask].to_numpy()})
         return " + ".join(found) if found else None

@@ -42,10 +42,25 @@ pytestmark = [
 # Hardcoded on purpose (not imported from polytope_io): the test must fail if
 # the writer's schema drifts from this contract.
 EXPECTED_KEYS = {
-    "A", "b", "X", "name_list", "kinds", "units", "scale",
-    "offset", "bounds_phys", "z_star_phys", "c_star", "epsilon", "tolerance",
-    "converged", "final_max_min_distance", "n_initial_rows", "point_origin",
-    "axis_meta_json", "run_json",
+    "A",
+    "b",
+    "X",
+    "name_list",
+    "kinds",
+    "units",
+    "scale",
+    "offset",
+    "bounds_phys",
+    "z_star_phys",
+    "c_star",
+    "epsilon",
+    "tolerance",
+    "converged",
+    "final_max_min_distance",
+    "n_initial_rows",
+    "point_origin",
+    "axis_meta_json",
+    "run_json",
 }
 
 
@@ -61,12 +76,19 @@ def _out_dir(tmp_path: Path, tag: str) -> Path:
 def _run_smoke(config_path: Path, out_dir: Path):
     """Run zen_garden on `config_path`; return (summary_dir, npz_path)."""
     res = subprocess.run(
-        [sys.executable, "-m", "zen_garden",
-         f"--config={config_path}", f"--folder_output={out_dir}"],
+        [
+            sys.executable,
+            "-m",
+            "zen_garden",
+            f"--config={config_path}",
+            f"--folder_output={out_dir}",
+        ],
         # dataset paths resolve relative to the config file; the cwd only
         # keeps gurobi.log out of the repo
         cwd=out_dir,
-        capture_output=True, text=True, timeout=3600,
+        capture_output=True,
+        text=True,
+        timeout=3600,
     )
     assert res.returncode == 0, (
         f"zen_garden failed (rc={res.returncode}):\n"
@@ -108,7 +130,9 @@ def _assert_polytope_properties(summary: Path, npz_path: Path, mga_cfg: dict):
     # Every stored feasible point satisfies the outer approximation.
     tol = 1e-6 * (1.0 + np.abs(b).max())
     violations = X @ A.T - b
-    assert (violations <= tol).all(), (
+    assert (
+        violations <= tol
+    ).all(), (
         f"containment violated: max violation {violations.max():.3e} > tol {tol:.3e}"
     )
 
@@ -132,7 +156,7 @@ def _assert_polytope_properties(summary: Path, npz_path: Path, mga_cfg: dict):
     assert sum(o.startswith("max:") for o in origins) == n_design
     assert sum(o.startswith("min:") for o in origins) == n_design
     # everything past z* and the 2 * n_design extreme designs is a loop iterate
-    assert set(origins[1 + 2 * n_design:]) <= {"iterate"}
+    assert set(origins[1 + 2 * n_design :]) <= {"iterate"}
 
     # Scalars and run provenance.
     assert d["converged"].dtype == np.bool_
@@ -169,8 +193,14 @@ def test_oracle_smoke_full(tmp_path):
     summary, npz_path = _run_smoke(cfg_path, _out_dir(tmp_path, "full"))
     names, kinds, meta = _assert_polytope_properties(summary, npz_path, mga_cfg)
 
-    assert names == ["nuclear", "photovoltaics", "battery", "hydro_lump",
-                     "biomass", "net_present_cost"]
+    assert names == [
+        "nuclear",
+        "photovoltaics",
+        "battery",
+        "hydro_lump",
+        "biomass",
+        "net_present_cost",
+    ]
     assert kinds == ["tech_capacity"] * 4 + ["carrier_import", "total_cost"]
     assert meta["axes"][3]["members"] == ["reservoir_hydro", "run-of-river_hydro"]
 

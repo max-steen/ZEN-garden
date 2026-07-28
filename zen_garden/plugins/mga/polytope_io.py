@@ -52,10 +52,25 @@ TOTAL_COST = "total_cost"
 
 # Every key the schema defines; save_polytope writes all of them.
 NPZ_KEYS = (
-    "A", "b", "X", "name_list", "kinds", "units", "scale",
-    "offset", "bounds_phys", "z_star_phys", "c_star", "epsilon", "tolerance",
-    "converged", "final_max_min_distance", "n_initial_rows", "point_origin",
-    "axis_meta_json", "run_json",
+    "A",
+    "b",
+    "X",
+    "name_list",
+    "kinds",
+    "units",
+    "scale",
+    "offset",
+    "bounds_phys",
+    "z_star_phys",
+    "c_star",
+    "epsilon",
+    "tolerance",
+    "converged",
+    "final_max_min_distance",
+    "n_initial_rows",
+    "point_origin",
+    "axis_meta_json",
+    "run_json",
 )
 
 
@@ -120,7 +135,9 @@ def save_polytope(path, poly: Polytope) -> None:
     """Write `poly` to `path` as an npz in the schema above."""
     np.savez(
         Path(path),
-        A=poly.A, b=poly.b, X=poly.X,
+        A=poly.A,
+        b=poly.b,
+        X=poly.X,
         name_list=np.array(poly.names),
         kinds=np.array(poly.kinds),
         units=np.array(poly.units),
@@ -167,23 +184,36 @@ def load_polytope(path) -> Polytope:
     if b.shape[0] != A.shape[0]:
         raise ValueError(f"{path}: b has {b.shape[0]} rows, A has {A.shape[0]}")
     lengths = {
-        "A columns": A.shape[1], "X columns": X.shape[1], "kinds": len(kinds),
-        "units": len(units), "scale": len(scale), "offset": len(offset),
-        "bounds_phys": bounds.shape[0], "z_star_phys": len(z_star),
+        "A columns": A.shape[1],
+        "X columns": X.shape[1],
+        "kinds": len(kinds),
+        "units": len(units),
+        "scale": len(scale),
+        "offset": len(offset),
+        "bounds_phys": bounds.shape[0],
+        "z_star_phys": len(z_star),
     }
     disagreeing = {k: v for k, v in lengths.items() if v != n_axes}
     if disagreeing:
-        raise ValueError(
-            f"{path}: {disagreeing} disagree with {n_axes} axis names."
-        )
+        raise ValueError(f"{path}: {disagreeing} disagree with {n_axes} axis names.")
     if np.any(scale == 0.0):
         raise ValueError(f"{path}: scale contains zeros; cannot de-normalise.")
 
     return Polytope(
-        A=A, b=b, X=X, names=names, kinds=kinds, units=units,
-        scale=scale, offset=offset, bounds_phys=bounds, z_star_phys=z_star,
-        c_star=float(d["c_star"]), epsilon=float(d["epsilon"]),
-        tolerance=float(d["tolerance"]), converged=bool(d["converged"]),
+        A=A,
+        b=b,
+        X=X,
+        names=names,
+        kinds=kinds,
+        units=units,
+        scale=scale,
+        offset=offset,
+        bounds_phys=bounds,
+        z_star_phys=z_star,
+        c_star=float(d["c_star"]),
+        epsilon=float(d["epsilon"]),
+        tolerance=float(d["tolerance"]),
+        converged=bool(d["converged"]),
         final_max_min_distance=float(d["final_max_min_distance"]),
         n_initial_rows=int(d["n_initial_rows"]),
         point_origin=[str(o) for o in d["point_origin"]],
@@ -195,6 +225,7 @@ def load_polytope(path) -> Polytope:
 # ---------------------------------------------------------------------------
 # Normalised <-> physical conversion (standalone, array-shape (..., n_axes))
 # ---------------------------------------------------------------------------
+
 
 def norm_to_phys(Z, scale, offset) -> np.ndarray:
     """Map normalised coordinates to physical units: Z * scale + offset."""
@@ -218,5 +249,3 @@ def phys_to_norm(Z, scale, offset) -> np.ndarray:
             f"last dimension {Z.shape[-1]} does not match {scale.shape[-1]} axes"
         )
     return (Z - offset) / scale
-
-
