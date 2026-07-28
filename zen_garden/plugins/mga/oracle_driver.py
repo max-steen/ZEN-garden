@@ -9,32 +9,33 @@ this module as follows:
                          inner point set here
     Step 2 (trial point) the max-min problem over the two approximations,
                          solved inside pyoNearOpt by the reformulation chosen
-                         in oracle.step2
+                         in oracle.max_min
     Step 3 (project)     MGA.find_nearest_point, one full model solve
     Step 4 (refine)      pyoNearOpt grows the inner hull and adds the cut
     Step 5 (terminate)   the artifacts written below, optionally after one
                          long certificate solve
 
-Step 2 supports two single-level reformulations, chosen by
-oracle.step2.formulation: "kkt_milp" is the published MILP (complementarity
+The max-min problem supports two single-level reformulations, chosen by
+oracle.max_min.formulation: "kkt_milp" is the published MILP (complementarity
 via SOS1 or big-M), whose reported dual bound can stall at the t_max cap once
 many inner points accumulate; "dual_bilinear" replaces the KKT system by LP
 duality (no binaries, solved globally by Gurobi's nonconvex mode) with
 identical witness and metric semantics but a bound that closes. After a
-non-converged loop, one long step-2 solve on the final geometry
-(step2.certificate_time_limit) can tighten the stored metric.
+non-converged loop, one long max-min solve on the final geometry
+(max_min.certificate_time_limit) can tighten the stored metric.
 
-The solver is hardcoded to Gurobi: the step-2 models need SOS1 constraints
+The solver is hardcoded to Gurobi: the max-min models need SOS1 constraints
 (kkt_milp without big-M) or global nonconvex QP solving (dual_bilinear), and
 the certificate reads Gurobi's dual bound directly.
 
-pyoNearOpt compatibility: with the base (published) package only the default
-"kkt_milp" formulation exists ("dual_bilinear" needs the patched package and
-fails otherwise). use_bigM defaults to true because the base package is only
-sound with the big-M encoding: under SOS1 it reports the step-2 INCUMBENT as
-the metric, which is not a valid upper bound on the max-min distance. Only
-set use_bigM = false (SOS1) with the patched package, which reads the true
-dual bound.
+pyoNearOpt compatibility: the base (published) package provides only the
+default "kkt_milp" formulation; "dual_bilinear" needs a pyoNearOpt that
+includes this formulation and fails otherwise. use_bigM defaults to true
+because the base package is only sound with the big-M encoding: under SOS1
+it reports the max-min INCUMBENT as the metric, which is not a valid upper
+bound on the max-min distance. Only set use_bigM = false (SOS1) if your
+pyoNearOpt reads the true dual bound (the version with the dual_bilinear
+addition does).
 """
 
 import importlib.metadata
@@ -67,16 +68,16 @@ def run_oracle_mode(mga, oracle_cfg):
     tolerance = float(oracle_cfg["tolerance"])  # required, deliberately no default
     max_iterations = int(oracle_cfg.get("max_iterations", 200))
     initial_bounds = oracle_cfg.get("initial_bounds", "vmm")
-    step2 = oracle_cfg.get("step2", {})
-    formulation = str(step2.get("formulation", "kkt_milp")).lower()
+    max_min_cfg = oracle_cfg.get("max_min", {})
+    formulation = str(max_min_cfg.get("formulation", "kkt_milp")).lower()
     if formulation not in FORMULATIONS:
         raise ValueError(
-            f"MGA oracle: unknown step-2 formulation {formulation!r}; "
+            f"MGA oracle: unknown max-min formulation {formulation!r}; "
             f"expected one of {list(FORMULATIONS)}."
         )
     # Only meaningful for kkt_milp; true is the sound default there (see
     # module docstring).
-    use_bigM = bool(step2.get("use_bigM", formulation == "kkt_milp"))
+    use_bigM = bool(max_min_cfg.get("use_bigM", formulation == "kkt_milp"))
 
     # Step 1: bounds (and, with VMM, the extreme designs) must exist before
     # the projection model is added, because they define the coordinates.
@@ -94,8 +95,9 @@ def run_oracle_mode(mga, oracle_cfg):
             name_list=list(mga.z_names),
             use_bigM=use_bigM,
         )
-        # Only the patched pyoNearOpt knows the keyword; the base package's
-        # sole formulation is kkt_milp, so omitting it is equivalent.
+        # Only a pyoNearOpt with the dual_bilinear addition knows the
+        # keyword; the base package's sole formulation is kkt_milp, so
+        # omitting it is equivalent.
         if formulation != "kkt_milp":
             approximation_kwargs["formulation"] = formulation
         poly = approximation(**approximation_kwargs)
@@ -103,12 +105,12 @@ def run_oracle_mode(mga, oracle_cfg):
         # use_bigM). It must exceed the true duals or optima are cut off;
         # pyoNearOpt raises when a dual reaches it, so the default here is
         # simply generous. t_max caps the max-min distance (default 1e6).
-        poly.Md = float(step2.get("big_M", 1e8))
-        if step2.get("t_max") is not None:
-            poly.t_max = float(step2["t_max"])
+        poly.Md = float(max_min_cfg.get("big_M", 1e8))
+        if max_min_cfg.get("t_max") is not None:
+            poly.t_max = float(max_min_cfg["t_max"])
 
-    # Gurobi options for the step-2 solves: solver defaults unless configured.
-    solver_options = dict(step2.get("solver_options", {}))
+    # Gurobi options for the max-min solves: solver defaults unless configured.
+    solver_options = dict(max_min_cfg.get("solver_options", {}))
     if formulation == "dual_bilinear":
         # The bilinear objective needs Gurobi's global nonconvex-QP mode.
         solver_options.setdefault("NonConvex", 2)
@@ -125,7 +127,7 @@ def run_oracle_mode(mga, oracle_cfg):
         print_lv=1,
     )
     logging.info(
-        f"MGA oracle: step-2 formulation = {formulation!r}, tol = "
+        f"MGA oracle: max-min formulation = {formulation!r}, tol = "
         f"{tolerance:.3g}, initial bounds = "
         f"{'VMM' if supplied is None else 'supplied'}"
     )
@@ -146,7 +148,7 @@ def run_oracle_mode(mga, oracle_cfg):
             df = algo.refine_approximations()
         iterations_done = 0 if df is None else int(len(df))
         df, metric_source = _run_final_certificate(
-            df, poly, tolerance, step2, solver_options
+            df, poly, tolerance, max_min_cfg, solver_options
         )
     finally:
         # Persist artifacts even if the loop raised mid-way (df stays None).
@@ -163,20 +165,20 @@ def run_oracle_mode(mga, oracle_cfg):
     return out
 
 
-def _run_final_certificate(df, poly, tolerance, step2, solver_options):
-    """One long step-2 solve on the final geometry after a non-converged loop.
+def _run_final_certificate(df, poly, tolerance, max_min_cfg, solver_options):
+    """One long max-min solve on the final geometry after a non-converged loop.
 
-    The per-iteration step-2 solves get a short time limit because the loop
+    The per-iteration max-min solves get a short time limit because the loop
     only needs the next trial point; the proof (the reported metric) is
     cheaper bought once, at the end. The loop's last reported metric is a
     valid cap for this solve (with the base pyoNearOpt this requires
     use_bigM, see the module docstring); the certified value is appended as
     an extra diagnostics row so the saved npz carries the best-known metric.
-    Controlled by oracle.step2.certificate_time_limit (seconds, 0 = off).
+    Controlled by oracle.max_min.certificate_time_limit (seconds, 0 = off).
 
     Returns (diagnostics, metric_source).
     """
-    time_limit = float(step2.get("certificate_time_limit", 0) or 0)
+    time_limit = float(max_min_cfg.get("certificate_time_limit", 0) or 0)
     if df is None or len(df) == 0 or time_limit <= 0:
         return df, "loop"
     last = float(df["max_min_distance"].iloc[-1])

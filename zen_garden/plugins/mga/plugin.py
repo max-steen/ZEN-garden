@@ -36,24 +36,10 @@ Glossary
 Every solve is written to disk as a sibling sub-solution of the baseline via
 Postprocess.
 
-Config (the "plugins.mga" block in config.json; unknown keys are rejected):
-    epsilon (float): near-optimality slack, default 0.1.
-    mode (str): "weights" (default) or "oracle".
-    iterations (list[dict]): weights mode; one {"weights": {tech: w}} dict
-        per iteration.
-    axes (dict): oracle mode.
-        technologies (list): technology axes; entries are technology names or
-            single-key dicts {group_name: [members]} for lumped axes.
-        carrier_imports (list): carrier-import axes, same entry format.
-        include_cost (bool): add the total-cost axis. Default False.
-    oracle (dict): tolerance (required), max_iterations (default 200),
-        initial_bounds ("vmm" (default) or a dict {axis: [lower, upper]}
-        covering every design axis), step2 (dict: formulation, use_bigM,
-        big_M, t_max, solver_options, certificate_time_limit). See
-        oracle_driver.py.
+Configured via the "plugins.mga" block in config.json; unknown keys are
+rejected. Full config reference: the README of this repository.
 
-pyoNearOpt compatibility (base vs patched package) is documented in
-oracle_driver.py.
+pyoNearOpt compatibility is documented in oracle_driver.py.
 """
 
 import logging
@@ -86,8 +72,8 @@ config = {
 _KNOWN_KEYS = {
     "plugins.mga": {"epsilon", "mode", "iterations", "axes", "oracle"},
     "plugins.mga.axes": {"technologies", "carrier_imports", "include_cost"},
-    "plugins.mga.oracle": {"tolerance", "max_iterations", "initial_bounds", "step2"},
-    "plugins.mga.oracle.step2": {
+    "plugins.mga.oracle": {"tolerance", "max_iterations", "initial_bounds", "max_min"},
+    "plugins.mga.oracle.max_min": {
         "formulation",
         "use_bigM",
         "big_M",
@@ -143,7 +129,7 @@ def validate_config(cfg) -> None:
         ("plugins.mga", cfg),
         ("plugins.mga.axes", cfg.get("axes", {})),
         ("plugins.mga.oracle", cfg.get("oracle", {})),
-        ("plugins.mga.oracle.step2", cfg.get("oracle", {}).get("step2", {})),
+        ("plugins.mga.oracle.max_min", cfg.get("oracle", {}).get("max_min", {})),
     ):
         unknown = sorted(set(block) - _KNOWN_KEYS[label])
         if unknown:

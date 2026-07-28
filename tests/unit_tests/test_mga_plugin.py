@@ -82,7 +82,7 @@ def test_valid_config_passes():
             "epsilon": 0.1,
             "mode": "oracle",
             "axes": {"technologies": ["nuclear"], "include_cost": True},
-            "oracle": {"tolerance": 0.1, "step2": {"use_bigM": True}},
+            "oracle": {"tolerance": 0.1, "max_min": {"use_bigM": True}},
         }
     )
 
@@ -93,7 +93,7 @@ def test_valid_config_passes():
         {"epsilonn": 0.1},  # top-level typo
         {"axes": {"technolgies": []}},  # axes typo
         {"oracle": {"tolerance": 0.1, "max_iter": 10}},  # oracle typo
-        {"oracle": {"step2": {"milp_options": {}}}},  # renamed key
+        {"oracle": {"max_min": {"milp_options": {}}}},  # renamed key
     ],
 )
 def test_unknown_config_keys_are_rejected(cfg):
